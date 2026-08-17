@@ -1,0 +1,23 @@
+# Local development only. Production Postgres is provisioned separately.
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: forge-postgres
+    environment:
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge
+      POSTGRES_DB: forge
+    ports:
+      - "55432:5432"
+    volumes:
+      # Postgres 18+ wants the mount one level up from `data` so pg_upgrade --link can work
+      # across a version bump without crossing a mount boundary.
+      - forge-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  forge-pgdata:

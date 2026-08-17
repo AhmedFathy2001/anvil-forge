@@ -1,0 +1,495 @@
+{
+  "skills": {
+    "overall": {
+      "rank": 117348,
+      "level": 2278,
+      "xp": 4600000000
+    },
+    "attack": {
+      "rank": 15,
+      "level": 99,
+      "xp": 200000000
+    },
+    "defence": {
+      "rank": 28,
+      "level": 99,
+      "xp": 200000000
+    },
+    "strength": {
+      "rank": 18,
+      "level": 99,
+      "xp": 200000000
+    },
+    "hitpoints": {
+      "rank": 7,
+      "level": 99,
+      "xp": 200000000
+    },
+    "ranged": {
+      "rank": 8,
+      "level": 99,
+      "xp": 200000000
+    },
+    "prayer": {
+      "rank": 11,
+      "level": 99,
+      "xp": 200000000
+    },
+    "magic": {
+      "rank": 29,
+      "level": 99,
+      "xp": 200000000
+    },
+    "cooking": {
+      "rank": 150,
+      "level": 99,
+      "xp": 200000000
+    },
+    "woodcutting": {
+      "rank": 15,
+      "level": 99,
+      "xp": 200000000
+    },
+    "fletching": {
+      "rank": 12,
+      "level": 99,
+      "xp": 200000000
+    },
+    "fishing": {
+      "rank": 9,
+      "level": 99,
+      "xp": 200000000
+    },
+    "firemaking": {
+      "rank": 47,
+      "level": 99,
+      "xp": 200000000
+    },
+    "crafting": {
+      "rank": 4,
+      "level": 99,
+      "xp": 200000000
+    },
+    "smithing": {
+      "rank": 3,
+      "level": 99,
+      "xp": 200000000
+    },
+    "mining": {
+      "rank": 23,
+      "level": 99,
+      "xp": 200000000
+    },
+    "herblore": {
+      "rank": 5,
+      "level": 99,
+      "xp": 200000000
+    },
+    "agility": {
+      "rank": 23,
+      "level": 99,
+      "xp": 200000000
+    },
+    "thieving": {
+      "rank": 12,
+      "level": 99,
+      "xp": 200000000
+    },
+    "slayer": {
+      "rank": 2,
+      "level": 99,
+      "xp": 200000000
+    },
+    "farming": {
+      "rank": 19,
+      "level": 99,
+      "xp": 200000000
+    },
+    "runecraft": {
+      "rank": 6,
+      "level": 99,
+      "xp": 200000000
+    },
+    "hunter": {
+      "rank": 3,
+      "level": 99,
+      "xp": 200000000
+    },
+    "construction": {
+      "rank": 4,
+      "level": 99,
+      "xp": 200000000
+    },
+    "sailing": {
+      "rank": -1,
+      "level": 1,
+      "xp": 0
+    }
+  },
+  "leaguePoints": {
+    "rank": -1,
+    "score": -1
+  },
+  "deadmanPoints": {
+    "rank": -1,
+    "score": -1
+  },
+  "bountyHunter": {
+    "hunterV2": {
+      "rank": -1,
+      "score": -1
+    },
+    "rogueV2": {
+      "rank": -1,
+      "score": -1
+    },
+    "hunter": {
+      "rank": -1,
+      "score": -1
+    },
+    "rogue": {
+      "rank": -1,
+      "score": -1
+    }
+  },
+  "lastManStanding": {
+    "rank": -1,
+    "score": -1
+  },
+  "pvpArena": {
+    "rank": -1,
+    "score": -1
+  },
+  "soulWarsZeal": {
+    "rank": -1,
+    "score": -1
+  },
+  "riftsClosed": {
+    "rank": -1,
+    "score": -1
+  },
+  "colosseumGlory": {
+    "rank": -1,
+    "score": -1
+  },
+  "collectionsLogged": {
+    "rank": -1,
+    "score": -1
+  },
+  "clues": {
+    "all": {
+      "rank": 1129139,
+      "score": 22
+    },
+    "beginner": {
+      "rank": -1,
+      "score": -1
+    },
+    "easy": {
+      "rank": -1,
+      "score": -1
+    },
+    "medium": {
+      "rank": -1,
+      "score": -1
+    },
+    "hard": {
+      "rank": 679860,
+      "score": 22
+    },
+    "elite": {
+      "rank": -1,
+      "score": -1
+    },
+    "master": {
+      "rank": -1,
+      "score": -1
+    }
+  },
+  "bosses": {
+    "abyssalSire": {
+      "rank": -1,
+      "score": -1
+    },
+    "alchemicalHydra": {
+      "rank": -1,
+      "score": -1
+    },
+    "amoxliatl": {
+      "rank": -1,
+      "score": -1
+    },
+    "araxxor": {
+      "rank": -1,
+      "score": -1
+    },
+    "artio": {
+      "rank": -1,
+      "score": -1
+    },
+    "barrows": {
+      "rank": -1,
+      "score": -1
+    },
+    "brutus": {
+      "rank": -1,
+      "score": 0
+    },
+    "bryophyta": {
+      "rank": -1,
+      "score": -1
+    },
+    "callisto": {
+      "rank": -1,
+      "score": -1
+    },
+    "calvarion": {
+      "rank": -1,
+      "score": -1
+    },
+    "cerberus": {
+      "rank": -1,
+      "score": -1
+    },
+    "chambersOfXeric": {
+      "rank": -1,
+      "score": -1
+    },
+    "chambersOfXericChallengeMode": {
+      "rank": -1,
+      "score": -1
+    },
+    "chaosElemental": {
+      "rank": -1,
+      "score": -1
+    },
+    "chaosFanatic": {
+      "rank": -1,
+      "score": -1
+    },
+    "commanderZilyana": {
+      "rank": -1,
+      "score": -1
+    },
+    "corporealBeast": {
+      "rank": -1,
+      "score": -1
+    },
+    "crazyArchaeologist": {
+      "rank": -1,
+      "score": -1
+    },
+    "dagannothPrime": {
+      "rank": -1,
+      "score": -1
+    },
+    "dagannothRex": {
+      "rank": -1,
+      "score": -1
+    },
+    "dagannothSupreme": {
+      "rank": -1,
+      "score": -1
+    },
+    "derangedArchaeologist": {
+      "rank": -1,
+      "score": -1
+    },
+    "doomOfMokhaiotl": {
+      "rank": -1,
+      "score": -1
+    },
+    "dukeSucellus": {
+      "rank": -1,
+      "score": -1
+    },
+    "generalGraardor": {
+      "rank": -1,
+      "score": -1
+    },
+    "giantMole": {
+      "rank": -1,
+      "score": -1
+    },
+    "grotesqueGuardians": {
+      "rank": -1,
+      "score": -1
+    },
+    "hespori": {
+      "rank": -1,
+      "score": -1
+    },
+    "kalphiteQueen": {
+      "rank": -1,
+      "score": -1
+    },
+    "kingBlackDragon": {
+      "rank": -1,
+      "score": -1
+    },
+    "kraken": {
+      "rank": -1,
+      "score": -1
+    },
+    "kreeArra": {
+      "rank": -1,
+      "score": -1
+    },
+    "krilTsutsaroth": {
+      "rank": -1,
+      "score": -1
+    },
+    "lunarChests": {
+      "rank": -1,
+      "score": -1
+    },
+    "mimic": {
+      "rank": -1,
+      "score": -1
+    },
+    "nex": {
+      "rank": -1,
+      "score": -1
+    },
+    "nightmare": {
+      "rank": -1,
+      "score": -1
+    },
+    "phosanisNightmare": {
+      "rank": -1,
+      "score": -1
+    },
+    "obor": {
+      "rank": -1,
+      "score": -1
+    },
+    "phantomMuspah": {
+      "rank": -1,
+      "score": -1
+    },
+    "sarachnis": {
+      "rank": -1,
+      "score": -1
+    },
+    "scorpia": {
+      "rank": -1,
+      "score": -1
+    },
+    "scurrius": {
+      "rank": -1,
+      "score": -1
+    },
+    "shellbaneGryphon": {
+      "rank": -1,
+      "score": -1
+    },
+    "skotizo": {
+      "rank": -1,
+      "score": -1
+    },
+    "solHeredit": {
+      "rank": -1,
+      "score": -1
+    },
+    "spindel": {
+      "rank": -1,
+      "score": -1
+    },
+    "tempoross": {
+      "rank": -1,
+      "score": -1
+    },
+    "gauntlet": {
+      "rank": -1,
+      "score": -1
+    },
+    "corruptedGauntlet": {
+      "rank": -1,
+      "score": -1
+    },
+    "hueycoatl": {
+      "rank": -1,
+      "score": -1
+    },
+    "leviathan": {
+      "rank": -1,
+      "score": -1
+    },
+    "royalTitans": {
+      "rank": -1,
+      "score": -1
+    },
+    "whisperer": {
+      "rank": -1,
+      "score": -1
+    },
+    "theatreOfBlood": {
+      "rank": -1,
+      "score": -1
+    },
+    "theatreOfBloodHardMode": {
+      "rank": -1,
+      "score": -1
+    },
+    "thermonuclearSmokeDevil": {
+      "rank": -1,
+      "score": -1
+    },
+    "tombsOfAmascut": {
+      "rank": -1,
+      "score": -1
+    },
+    "tombsOfAmascutExpertMode": {
+      "rank": -1,
+      "score": -1
+    },
+    "tzKalZuk": {
+      "rank": -1,
+      "score": -1
+    },
+    "tzTokJad": {
+      "rank": 434,
+      "score": 186
+    },
+    "vardorvis": {
+      "rank": -1,
+      "score": -1
+    },
+    "venenatis": {
+      "rank": -1,
+      "score": -1
+    },
+    "vetion": {
+      "rank": -1,
+      "score": -1
+    },
+    "vorkath": {
+      "rank": -1,
+      "score": -1
+    },
+    "wintertodt": {
+      "rank": -1,
+      "score": -1
+    },
+    "yama": {
+      "rank": -1,
+      "score": -1
+    },
+    "zalcano": {
+      "rank": -1,
+      "score": -1
+    },
+    "zulrah": {
+      "rank": -1,
+      "score": -1
+    },
+    "madAngel": {
+      "rank": -1,
+      "score": 0
+    },
+    "maggotKing": {
+      "rank": -1,
+      "score": 0
+    }
+  }
+}
