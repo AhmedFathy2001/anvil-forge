@@ -15,19 +15,42 @@ Anvil.Site, in TypeScript, where it already works.
 | Step | State |
 |---|---|
 | 2. Hiscores sweep | **working** — scheduler, ladder, client, persistence, outbox |
-| 3. Plugin read path (`ETag`/304 board + config) | not started |
-| 4. Plugin ingest writes | not started |
-| 5. Discord fan-out queue | not started |
-| 6. Discord gateway | not started |
+| 3. Plugin read path (`ETag`/304 config + board) | **working** — content-addressed payloads, pre-gzipped, 304 on match |
+| 4. Plugin ingest writes | **working** — token auth, batched pushes, idempotent, heartbeats |
+| 5. Discord fan-out queue | **working** — durable, per-webhook rate limits, 429-aware, dead-webhook detection |
+| 6. Discord gateway | **deliberately not built** — see below |
+
+### Why step 6 is not here
+
+The gateway needs a bot token to be worth anything, and a hand-rolled WebSocket client covering
+sharding, resume, session invalidation and identify rate limits is a large amount of code that
+cannot be tested without one. Shipping that untested would be worse than not shipping it.
+
+When the shared bot is real and past Discord's verification gate (required above 100 guilds), the
+work is: add `bwmarrin/discordgo`, connect with the right shard count, and write received events
+into an inbox table the Site consumes — the same pattern as `player_events` and
+`plugin_ingest_events`. The *outbound* direction, which is what most features actually need, is
+already covered by the delivery queue in step 5.
+
+Steps 2–4 need the Site's Postgres migration and payload-writing before they can run on real data.
+Step 5 is independent and could be pointed at production today.
 
 ## Running it locally
 
 ```bash
 docker compose up -d                                    # Postgres on :55432
 export DATABASE_URL="postgres://forge:forge@localhost:55432/forge"
-psql "$DATABASE_URL" -f migrations/0001_init.sql
+for f in migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
 psql "$DATABASE_URL" -f scripts/seed-dev.sql            # real accounts, incl. a deliberate 404
 go run ./cmd/forge
+```
+
+Each subsystem can be run alone — useful because they scale differently. The edge is stateless and
+scales horizontally; the sweep must stay a single instance, because its rate budget is global and
+cannot be divided across replicas without coordination.
+
+```bash
+FORGE_ENABLE_SWEEP=false FORGE_ENABLE_DISCORD=false go run ./cmd/forge   # edge only
 ```
 
 `FORGE_DRY_RUN=true` polls for real and writes nothing but the run log — the way to observe
@@ -50,8 +73,27 @@ go test ./internal/sweep -v         # prints the budget arithmetic
 | `FORGE_CLAIM_LEASE` | `5m` | a crashed worker costs its players this much delay |
 | `FORGE_TICK_INTERVAL` | `10s` | how often to look for due players — *not* the polling cadence |
 | `FORGE_DRY_RUN` | `false` | |
-| `FORGE_HTTP_ADDR` | `:8080` | `/health` (liveness), `/ready` (DB + backlog) |
+| `FORGE_HTTP_ADDR` | `:8080` | `/health` (liveness), `/ready` (DB + backlog), plugin edge |
 | `FORGE_LOG_LEVEL` | `info` | |
+| `FORGE_ENABLE_SWEEP` / `_EDGE` / `_DISCORD` | `true` | run subsystems independently |
+| `FORGE_DISCORD_WORKERS` | `16` | |
+| `FORGE_DISCORD_CLAIM_BATCH` | `100` | |
+| `FORGE_DISCORD_KEEP_DELIVERED` | `72h` | retention for delivered rows |
+
+## HTTP surface
+
+| Route | Notes |
+|---|---|
+| `GET /health` | liveness; never touches the database |
+| `GET /ready` | readiness; pings Postgres and reports sweep backlog |
+| `GET /api/plugin/config` | bearer auth, `ETag`/304, pre-gzipped |
+| `GET /api/plugin/board` | same, plus anonymous `?eventId=` preview |
+| `POST /api/plugin/ingest` | single or batched pushes, idempotent via `dedupeKey`, returns **202** |
+| `POST /api/plugin/heartbeat` | stamps `live_seen_at`; the strongest signal the sweep gets |
+
+`202` on ingest rather than `200` is deliberate: the events are durably stored but nothing has been
+*scored* yet. The Site decides what any of it means, so promising more would be a lie the plugin
+might act on.
 
 ## The thing to understand before changing the scheduler
 

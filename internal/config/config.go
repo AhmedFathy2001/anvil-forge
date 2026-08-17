@@ -54,8 +54,25 @@ type Config struct {
 	// letting it touch a row.
 	DryRun bool
 
-	// HTTPAddr serves health and metrics.
+	// HTTPAddr serves health, metrics, and the plugin edge.
 	HTTPAddr string
+
+	// Which subsystems this process runs. All three in one process is right for a single box;
+	// splitting them lets the plugin edge scale horizontally (it is stateless) while the sweep
+	// stays a single instance (its rate budget is global and cannot be divided by replicas
+	// without coordination).
+	EnableSweep   bool
+	EnableEdge    bool
+	EnableDiscord bool
+
+	// Discord delivery.
+	DiscordWorkers    int
+	DiscordClaimBatch int
+	DiscordClaimLease time.Duration
+	DiscordTickEvery  time.Duration
+	// DiscordKeepDelivered is how long delivered rows survive. Long enough to answer "did that
+	// post?", short enough that the fastest-growing table in the database stays bounded.
+	DiscordKeepDelivered time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults sized for a single box.
@@ -71,6 +88,20 @@ func Load() (*Config, error) {
 		UserAgent:     envStr("FORGE_USER_AGENT", "Anvil.Forge/1.0 (+https://anvilosrs.com; contact@anvilosrs.com)"),
 		DryRun:        envBool("FORGE_DRY_RUN", false),
 		HTTPAddr:      envStr("FORGE_HTTP_ADDR", ":8080"),
+
+		EnableSweep:   envBool("FORGE_ENABLE_SWEEP", true),
+		EnableEdge:    envBool("FORGE_ENABLE_EDGE", true),
+		EnableDiscord: envBool("FORGE_ENABLE_DISCORD", true),
+
+		DiscordWorkers:       envInt("FORGE_DISCORD_WORKERS", 16),
+		DiscordClaimBatch:    envInt("FORGE_DISCORD_CLAIM_BATCH", 100),
+		DiscordClaimLease:    envDuration("FORGE_DISCORD_CLAIM_LEASE", 2*time.Minute),
+		DiscordTickEvery:     envDuration("FORGE_DISCORD_TICK", 2*time.Second),
+		DiscordKeepDelivered: envDuration("FORGE_DISCORD_KEEP_DELIVERED", 72*time.Hour),
+	}
+
+	if !c.EnableSweep && !c.EnableEdge && !c.EnableDiscord {
+		return nil, fmt.Errorf("every subsystem is disabled; nothing to run")
 	}
 
 	if c.DatabaseURL == "" {

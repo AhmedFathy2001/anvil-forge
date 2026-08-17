@@ -1,9 +1,9 @@
-// Command forge runs Anvil's data plane: the hiscores sweep today, plugin ingest and the Discord
-// fan-out queue as they are extracted.
+// Command forge runs Anvil's data plane: the hiscores sweep, the plugin edge, and the Discord
+// delivery queue.
 //
-// It deliberately does NOT evaluate anything. Whether a snapshot completes a tile, crosses a
-// milestone, or moves a weekly standing is decided by Anvil.Site, which consumes the player_events
-// outbox. See docs/BOUNDARY.md for why that line is where it is.
+// It deliberately does NOT evaluate anything. Whether a snapshot completes a tile, whether a drop
+// is worth announcing, what a weekly standing is — all decided by Anvil.Site, which consumes the
+// outbox tables Forge writes. See docs/BOUNDARY.md for why that line is where it is.
 package main
 
 import (
@@ -14,13 +14,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/time/rate"
 
 	"github.com/anvilosrs/forge/internal/config"
+	"github.com/anvilosrs/forge/internal/discord"
+	"github.com/anvilosrs/forge/internal/edge"
 	"github.com/anvilosrs/forge/internal/hiscores"
+	"github.com/anvilosrs/forge/internal/ratelimit"
 	"github.com/anvilosrs/forge/internal/store"
 	"github.com/anvilosrs/forge/internal/sweep"
 )
@@ -50,55 +54,49 @@ func run(log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	if err := db.EnsurePartitions(ctx); err != nil {
-		return err
+	if cfg.EnableSweep {
+		if err := db.EnsurePartitions(ctx); err != nil {
+			return err
+		}
 	}
 
-	runner := &sweep.Runner{
-		Store:        db,
-		Hiscores:     hiscores.NewClient(cfg.UserAgent),
-		Log:          log,
-		Limiter:      rate.NewLimiter(rate.Limit(cfg.HiscoresRPS), cfg.HiscoresBurst),
-		Workers:      cfg.Workers,
-		ClaimBatch:   cfg.ClaimBatch,
-		ClaimLease:   cfg.ClaimLease,
-		TickInterval: cfg.TickInterval,
+	mux := http.NewServeMux()
+	registerHealth(mux, db)
+
+	var edgeServer *edge.Server
+	if cfg.EnableEdge {
+		edgeServer = &edge.Server{Store: edge.NewStore(db.Pool()), Log: log}
+		for pattern, handler := range routesOf(edgeServer) {
+			mux.Handle(pattern, handler)
+		}
 	}
 
-	srv := healthServer(cfg.HTTPAddr, db, log)
+	srv := &http.Server{
+		Addr:    cfg.HTTPAddr,
+		Handler: mux,
+		// The plugin edge is public, so these are the guard against a slow or hostile client
+		// occupying a connection indefinitely.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("health server failed", "error", err)
+			log.Error("http server failed", "error", err)
 		}
 	}()
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	// Keep the snapshot partitions ahead of the calendar. An insert into an uncovered range is a
-	// hard error, so this is not a tidiness job — miss it and every write fails at midnight on the
-	// first of the month.
-	go func() {
-		t := time.NewTicker(24 * time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if err := db.EnsurePartitions(ctx); err != nil {
-					log.Error("ensuring partitions", "error", err)
-				}
-			}
-		}
-	}()
-
 	log.Info("forge starting",
+		"sweep", cfg.EnableSweep,
+		"edge", cfg.EnableEdge,
+		"discord", cfg.EnableDiscord,
 		"hiscoresRps", cfg.HiscoresRPS,
-		"workers", cfg.Workers,
-		"claimBatch", cfg.ClaimBatch,
 		"dryRun", cfg.DryRun,
 		"httpAddr", cfg.HTTPAddr,
 	)
@@ -106,15 +104,92 @@ func run(log *slog.Logger) error {
 		log.Warn("DRY RUN: polling for real, writing nothing but the run log")
 	}
 
-	return runner.Run(ctx)
+	var wg sync.WaitGroup
+
+	if cfg.EnableSweep {
+		runner := &sweep.Runner{
+			Store:    db,
+			Hiscores: hiscores.NewClient(cfg.UserAgent),
+			Log:      log,
+			// One limiter for the process. Per-worker limits compose into a total nobody chose,
+			// which is exactly how a safe per-clan-container rate became an unsafe per-box one.
+			Limiter:      rate.NewLimiter(rate.Limit(cfg.HiscoresRPS), cfg.HiscoresBurst),
+			Workers:      cfg.Workers,
+			ClaimBatch:   cfg.ClaimBatch,
+			ClaimLease:   cfg.ClaimLease,
+			TickInterval: cfg.TickInterval,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("sweep stopped", "error", err)
+			}
+		}()
+
+		// Keep the snapshot partitions ahead of the calendar. Not tidiness: an insert into an
+		// uncovered range is a hard error, so missing this fails every write at midnight on the
+		// first of the month.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			everyDay(ctx, func() {
+				if err := db.EnsurePartitions(ctx); err != nil {
+					log.Error("ensuring partitions", "error", err)
+				}
+			})
+		}()
+	}
+
+	if cfg.EnableDiscord {
+		worker := &discord.Worker{
+			Queue:  discord.NewQueue(db.Pool()),
+			Sender: discord.NewSender(cfg.UserAgent),
+			Log:    log,
+			// Keyed by webhook because Discord limits per webhook. A global limiter would throttle
+			// a quiet clan on account of a busy one and still exceed the limit on the busy one.
+			Limiter:       ratelimit.NewKeyed(discord.WebhookRatePerSecond, discord.WebhookBurst, 15*time.Minute),
+			Workers:       cfg.DiscordWorkers,
+			ClaimBatch:    cfg.DiscordClaimBatch,
+			ClaimLease:    cfg.DiscordClaimLease,
+			TickEvery:     cfg.DiscordTickEvery,
+			KeepDelivered: cfg.DiscordKeepDelivered,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("discord worker stopped", "error", err)
+			}
+		}()
+	}
+
+	if edgeServer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reportEdge(ctx, edgeServer, log)
+		}()
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+	return ctx.Err()
 }
 
-func healthServer(addr string, db *store.Store, log *slog.Logger) *http.Server {
-	mux := http.NewServeMux()
+// routesOf adapts the edge's mux into patterns we can mount alongside health.
+func routesOf(s *edge.Server) map[string]http.Handler {
+	inner := s.Routes()
+	return map[string]http.Handler{
+		"/api/plugin/": inner,
+	}
+}
 
+func registerHealth(mux *http.ServeMux, db *store.Store) {
 	// Liveness: the process is up. Deliberately does not touch the database — a health check that
 	// fails when Postgres blips gets the container killed exactly when restarting is least useful.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
@@ -138,13 +213,54 @@ func healthServer(addr string, db *store.Store, log *slog.Logger) *http.Server {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "backlog": backlog})
 	})
+}
 
-	return &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+// reportEdge logs the edge's counters periodically.
+//
+// The ratio of 304s to 200s is the whole justification for extracting the read path: if not-modified
+// vastly exceeds modified, the extraction is paying for itself and the number to watch is egress.
+// If it does not, something is churning the ETag and the payload builder needs looking at.
+func reportEdge(ctx context.Context, s *edge.Server, log *slog.Logger) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			served, notModified, ingested, duplicates := s.Stats()
+			if served+notModified+ingested+duplicates == 0 {
+				continue
+			}
+			var hitRate float64
+			if total := served + notModified; total > 0 {
+				hitRate = float64(notModified) / float64(total)
+			}
+			log.Info("edge.minute",
+				"served", served,
+				"notModified", notModified,
+				"notModifiedRate", round2(hitRate),
+				"ingested", ingested,
+				"duplicates", duplicates,
+			)
+		}
 	}
 }
+
+func everyDay(ctx context.Context, fn func()) {
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fn()
+		}
+	}
+}
+
+func round2(f float64) float64 { return float64(int(f*100+0.5)) / 100 }
 
 func logLevel() slog.Level {
 	switch os.Getenv("FORGE_LOG_LEVEL") {
