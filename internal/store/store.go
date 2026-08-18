@@ -75,19 +75,19 @@ type Claim struct {
 // again when the lease elapses. The real next_poll_at is written afterwards by ApplyResult.
 func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]Claim, error) {
 	const q = `
-		UPDATE sweep_state s
+		UPDATE forge_sweep_state s
 		SET next_poll_at = now() + $2::interval,
 		    claimed_at   = now()
 		FROM (
 		  SELECT player_id
-		  FROM sweep_state
+		  FROM forge_sweep_state
 		  WHERE enrolled AND next_poll_at <= now()
 		  ORDER BY next_poll_at
 		  LIMIT $1
 		  FOR UPDATE SKIP LOCKED
 		) due
-		JOIN players p ON p.id = due.player_id
-		LEFT JOIN player_current pc ON pc.player_id = due.player_id
+		JOIN forge_players p ON p.id = due.player_id
+		LEFT JOIN forge_player_current pc ON pc.player_id = due.player_id
 		WHERE s.player_id = due.player_id
 		  AND p.status = 'active'
 		RETURNING s.player_id, p.rsn, s.miss_streak, s.error_streak,
@@ -125,7 +125,7 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 func (s *Store) Backlog(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM sweep_state WHERE enrolled AND next_poll_at <= now()`).Scan(&n)
+		`SELECT count(*) FROM forge_sweep_state WHERE enrolled AND next_poll_at <= now()`).Scan(&n)
 	return n, err
 }
 
@@ -134,7 +134,7 @@ func (s *Store) Backlog(ctx context.Context) (int, error) {
 func (s *Store) PreviousSnapshot(ctx context.Context, playerID int64) (*hiscores.Snapshot, error) {
 	var raw []byte
 	err := s.pool.QueryRow(ctx,
-		`SELECT snapshot FROM player_current WHERE player_id = $1`, playerID).Scan(&raw)
+		`SELECT snapshot FROM forge_player_current WHERE player_id = $1`, playerID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -190,7 +190,7 @@ func (s *Store) Apply(ctx context.Context, o Outcome) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx, `
-		UPDATE sweep_state
+		UPDATE forge_sweep_state
 		SET next_poll_at   = $2,
 		    tier           = $3,
 		    miss_streak    = $4,
@@ -210,7 +210,7 @@ func (s *Store) Apply(ctx context.Context, o Outcome) error {
 		// Take them out of the sweep entirely. Without this one renamed account 404s every tick
 		// forever and steals a slot from a healthy row.
 		if _, err := tx.Exec(ctx, `
-			UPDATE players SET status = 'unranked', status_checked_at = now()
+			UPDATE forge_players SET status = 'unranked', status_checked_at = now()
 			WHERE id = $1 AND status = 'active'`, o.PlayerID); err != nil {
 			return fmt.Errorf("flagging %d unranked: %w", o.PlayerID, err)
 		}
@@ -221,7 +221,7 @@ func (s *Store) Apply(ctx context.Context, o Outcome) error {
 
 	case "ok":
 		if _, err := tx.Exec(ctx,
-			`UPDATE players SET last_seen_at = now() WHERE id = $1`, o.PlayerID); err != nil {
+			`UPDATE forge_players SET last_seen_at = now() WHERE id = $1`, o.PlayerID); err != nil {
 			return fmt.Errorf("touching player %d: %w", o.PlayerID, err)
 		}
 		if !o.Changed {
@@ -234,7 +234,7 @@ func (s *Store) Apply(ctx context.Context, o Outcome) error {
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO player_current (player_id, snapshot, overall_xp, captured_at)
+			INSERT INTO forge_player_current (player_id, snapshot, overall_xp, captured_at)
 			VALUES ($1, $2, $3, $4)
 			ON CONFLICT (player_id) DO UPDATE
 			SET snapshot = EXCLUDED.snapshot,
@@ -245,7 +245,7 @@ func (s *Store) Apply(ctx context.Context, o Outcome) error {
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO player_snapshots (player_id, captured_at, overall_xp, snapshot)
+			INSERT INTO forge_player_snapshots (player_id, captured_at, overall_xp, snapshot)
 			VALUES ($1, $2, $3, $4)`,
 			o.PlayerID, o.CapturedAt, o.OverallXp, blob); err != nil {
 			return fmt.Errorf("inserting snapshot for %d: %w", o.PlayerID, err)
@@ -272,7 +272,7 @@ func insertEvent(ctx context.Context, tx pgx.Tx, playerID int64, kind string, pa
 		return fmt.Errorf("marshalling %s payload: %w", kind, err)
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO player_events (player_id, kind, payload) VALUES ($1, $2, $3)`,
+		`INSERT INTO forge_player_events (player_id, kind, payload) VALUES ($1, $2, $3)`,
 		playerID, kind, blob); err != nil {
 		return fmt.Errorf("inserting %s event: %w", kind, err)
 	}
@@ -293,7 +293,7 @@ type RunStats struct {
 // point of dry-run, so the observation itself must land.
 func (s *Store) RecordRun(ctx context.Context, started time.Time, st RunStats) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO sweep_runs
+		INSERT INTO forge_sweep_runs
 		  (started_at, finished_at, claimed, fetched, changed, unranked, errors, backlog, shadow)
 		VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8)`,
 		started, st.Claimed, st.Fetched, st.Changed, st.Unranked, st.Errors, st.Backlog, s.DryRun)
@@ -310,7 +310,7 @@ func (s *Store) EnsurePartitions(ctx context.Context) error {
 	for months := 0; months <= 2; months++ {
 		when := time.Now().AddDate(0, months, 0)
 		if _, err := s.pool.Exec(ctx,
-			`SELECT ensure_snapshot_partition($1::date)`, when.Format("2006-01-02")); err != nil {
+			`SELECT forge_ensure_snapshot_partition($1::date)`, when.Format("2006-01-02")); err != nil {
 			return fmt.Errorf("ensuring partition for %s: %w", when.Format("2006-01"), err)
 		}
 	}

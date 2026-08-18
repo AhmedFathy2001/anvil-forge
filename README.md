@@ -32,8 +32,23 @@ into an inbox table the Site consumes — the same pattern as `player_events` an
 `plugin_ingest_events`. The *outbound* direction, which is what most features actually need, is
 already covered by the delivery queue in step 5.
 
-Steps 2–4 need the Site's Postgres migration and payload-writing before they can run on real data.
-Step 5 is independent and could be pointed at production today.
+### How this fits the Site's actual schema
+
+The multi-clan preview makes **clans** rows but keeps membership **per clan**: `clan_members` is
+unique on `(clan_id, rsn_normalized)`, so one OSRS account in three clans is three rows, each with
+its own `stats_next_due_at` / `stats_last_snapshot` / `live_stats`. Polled naively that is three
+hiscores requests for one account, which at a 5 req/s budget is the most expensive mistake
+available.
+
+Forge does not wait for the Site to adopt global identity — it **derives it**. `Reconcile` collapses
+every distinct account across every clan into one `forge_players` row and maps it to each membership
+it came from (`forge_player_clans`). One poll, fanned out. When the Site eventually unifies identity,
+that mapping is what the migration reads.
+
+All Forge tables are prefixed `forge_` because the Site already owns tables called `players` (its
+per-event bingo participants) and `player_snapshots`, with entirely different meanings.
+
+Step 5 is independent of all of this and could be pointed at production today.
 
 ## Running it locally
 
@@ -130,3 +145,23 @@ scripts/              name-table generator, dev seed
 ## Licence
 
 Same as the rest of Anvil: PolyForm Noncommercial + Attribution. Source-available, not open source.
+
+## Deploying
+
+CI mirrors Anvil.Admin's shape, not the Site's: Forge is a **singleton**, so there is no per-clan
+rollout. Build → GHCR → SSH → `docker compose up -d anvil-forge` → health gate.
+
+The health gate checks that `/health` reports the SHA CI just built, not merely that something
+answered — the question after a deploy is "is the new one running", and a green check on the old
+binary is worse than a red one.
+
+```
+deploy/compose-snippet.yml   # add to /opt/anvil/docker-compose.yml
+deploy/forge.env.example     # copy to /opt/anvil/forge.env
+```
+
+Repo secrets needed: `SSH_HOST`, `SSH_USER`, `SSH_KEY`, optionally `SSH_PORT`. Until `SSH_HOST` is
+set the deploy step is skipped and the build still publishes the image.
+
+The image is distroless (12 MB, no shell), so the container healthcheck runs the binary's own
+`-healthcheck` probe rather than shelling out to curl.

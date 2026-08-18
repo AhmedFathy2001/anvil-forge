@@ -22,7 +22,7 @@ BEGIN;
 -- config payload, so keying by content collapses what would be one row per member into one row per
 -- distinct payload: order 100k rows instead of order 2M, and a board edit rewrites one row rather
 -- than four hundred.
-CREATE TABLE plugin_payloads (
+CREATE TABLE forge_plugin_payloads (
   etag        text PRIMARY KEY,        -- the weak ETag, e.g. W/"base64sha1"
   body        bytea NOT NULL,
   -- Stored PRE-COMPRESSED. Compression is pure CPU we would otherwise pay on every 200, on the
@@ -37,19 +37,19 @@ CREATE TABLE plugin_payloads (
 -- Keyed on a HASH of the bearer token, never the token itself: this table is the hottest read in
 -- the service and will appear in slow-query logs, EXPLAIN output and backups. A plugin token is a
 -- credential and none of those places should be able to hand one out.
-CREATE TABLE plugin_bindings (
+CREATE TABLE forge_plugin_bindings (
   token_hash  bytea NOT NULL,
   kind        text  NOT NULL CHECK (kind IN ('config', 'board')),
-  etag        text  NOT NULL REFERENCES plugin_payloads(etag) ON DELETE CASCADE,
+  etag        text  NOT NULL REFERENCES forge_plugin_payloads(etag) ON DELETE CASCADE,
   updated_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (token_hash, kind)
 );
 
 -- Anonymous board previews (`/board?eventId=`) are not bound to a caller, so they get their own
 -- tiny keyspace rather than a fabricated token.
-CREATE TABLE plugin_public_payloads (
+CREATE TABLE forge_plugin_public_payloads (
   scope_key   text PRIMARY KEY,        -- e.g. 'board:event:412'
-  etag        text NOT NULL REFERENCES plugin_payloads(etag) ON DELETE CASCADE,
+  etag        text NOT NULL REFERENCES forge_plugin_payloads(etag) ON DELETE CASCADE,
   updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
@@ -60,9 +60,9 @@ CREATE TABLE plugin_public_payloads (
 -- Who may push. The Site owns account linking, verification and auto-claim — all of which are
 -- domain decisions with real subtlety (see resolvePluginMember in Anvil.Site) — and publishes the
 -- resulting answer here as a flat, fast lookup.
-CREATE TABLE plugin_credentials (
+CREATE TABLE forge_plugin_credentials (
   token_hash    bytea PRIMARY KEY,
-  player_id     bigint REFERENCES players(id) ON DELETE CASCADE,
+  player_id     bigint REFERENCES forge_players(id) ON DELETE CASCADE,
   -- Opaque Site-side identity (its users.id). Forge never interprets it; it is carried through to
   -- the ingest event so the Site can attribute the push without a second lookup.
   subject       text,
@@ -72,7 +72,7 @@ CREATE TABLE plugin_credentials (
   last_seen_at  timestamptz
 );
 
-CREATE INDEX plugin_credentials_player_idx ON plugin_credentials (player_id)
+CREATE INDEX forge_plugin_credentials_player_idx ON forge_plugin_credentials (player_id)
   WHERE revoked_at IS NULL;
 
 -- Raw pushes from the game client. APPEND ONLY.
@@ -84,9 +84,9 @@ CREATE INDEX plugin_credentials_player_idx ON plugin_credentials (player_id)
 --
 -- Durable rather than fire-and-forget because scoring bugs are then replayable: fix the rule, reset
 -- consumed_at over a range, re-consume. A push that was evaluated in-request and discarded is gone.
-CREATE TABLE plugin_ingest_events (
+CREATE TABLE forge_plugin_ingest_events (
   id           bigserial PRIMARY KEY,
-  player_id    bigint REFERENCES players(id) ON DELETE SET NULL,
+  player_id    bigint REFERENCES forge_players(id) ON DELETE SET NULL,
   subject      text,
   -- 'stats' | 'kill' | 'drop' | 'clog' | 'pb' | 'moment' | 'clip' | 'counter' | 'death' | ...
   -- Deliberately not a CHECK constraint: the plugin ships new event kinds ahead of the server that
@@ -101,10 +101,10 @@ CREATE TABLE plugin_ingest_events (
   dedupe_key   text
 );
 
-CREATE UNIQUE INDEX plugin_ingest_dedupe_idx ON plugin_ingest_events (dedupe_key)
+CREATE UNIQUE INDEX plugin_ingest_dedupe_idx ON forge_plugin_ingest_events (dedupe_key)
   WHERE dedupe_key IS NOT NULL;
 
-CREATE INDEX plugin_ingest_unconsumed_idx ON plugin_ingest_events (id)
+CREATE INDEX plugin_ingest_unconsumed_idx ON forge_plugin_ingest_events (id)
   WHERE consumed_at IS NULL;
 
 COMMIT;

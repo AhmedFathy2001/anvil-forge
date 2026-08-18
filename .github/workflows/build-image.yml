@@ -1,0 +1,167 @@
+name: Build & deploy
+
+# Build the Forge image, push it to GHCR, then deploy it to the box over SSH.
+#
+# Deliberately NOT the Site's rollout pattern. The Site fans a new image out across many clan
+# containers through the control plane; Forge is a SINGLETON — one process for the whole box,
+# because its hiscores rate budget is global and cannot be divided across replicas without
+# coordination. So this mirrors Anvil.Admin's shape instead: pull, recreate, health-gate.
+#
+#   main → :stable (+ :latest) → deployed
+#   beta → :beta               → deployed to the same box (see FORGE_CHANNEL below)
+#   v*   → :1.2.3 + :1.2       → pinned images for self-hosters, NO deploy
+#
+# Every push also gets an immutable :sha-<full> tag, which is what the box actually pins.
+
+on:
+  push:
+    branches: [main, beta]
+    tags: ['v*']
+  pull_request:
+    branches: [main, beta]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Tests gate the build. Cheap here and expensive later: the hiscores parser test is the only thing
+  # standing between a bad name-table regeneration and every stat tile silently scoring zero.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race because the sweep, the Discord worker and the edge all run concurrent worker pools
+      # sharing rate limiters. A data race there is a rare production-only crash, which is exactly
+      # the kind CI should be catching instead of a user.
+      - name: Test
+        run: go test -race ./...
+
+  build:
+    needs: test
+    # Pull requests get tested and built (so a broken Dockerfile is caught in review) but never
+    # pushed or deployed.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      sha_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ahmedfathy2001/anvil-forge
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=stable,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=beta,enable=${{ github.ref == 'refs/heads/beta' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - name: Build & push (linux/amd64 — the box is an Intel i7)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    # A v* tag publishes a pinned image for self-hosters but must not redeploy: the commit it points
+    # at already deployed when its branch was pushed.
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    # One-time setup — repo secrets (Settings → Secrets and variables → Actions):
+    #   SSH_HOST — the box's IP/hostname
+    #   SSH_USER — deploy user (needs docker + access to /opt/anvil)
+    #   SSH_KEY  — that user's PRIVATE key; public key in ~/.ssh/authorized_keys on the box
+    #   SSH_PORT — optional (defaults to 22)
+    # Until SSH_HOST is set the deploy is skipped and the build still publishes the image.
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+    steps:
+      - name: Deploy over SSH
+        if: env.SSH_HOST != ''
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          IMAGE: ghcr.io/ahmedfathy2001/anvil-forge:sha-${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          envs: IMAGE
+          script: |
+            set -euo pipefail
+            cd /opt/anvil
+            # Pin the exact artifact CI just built rather than a moving tag, so "what is running"
+            # always has one answer and a rollback is editing one line.
+            sed -i "s|^FORGE_IMAGE=.*|FORGE_IMAGE=$IMAGE|" forge.env || echo "FORGE_IMAGE=$IMAGE" >> forge.env
+            docker compose pull anvil-forge
+            docker compose up -d anvil-forge
+            docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
+
+      # The deploy is only real if the new binary is actually serving. /health reports the SHA it
+      # was built from, so this checks the RIGHT version came up — not merely that something did.
+      - name: Health gate
+        if: env.SSH_HOST != ''
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          envs: EXPECTED_SHA
+          script: |
+            set -euo pipefail
+            for i in $(seq 1 20); do
+              # Reached over the shared Docker network: Forge publishes no host port, and it should
+              # not — only Caddy needs to see it, and only for the plugin edge.
+              body="$(docker run --rm --network anvil_default curlimages/curl:8.11.1 \
+                       -fsS --max-time 5 http://anvil-forge:8080/health 2>/dev/null || true)"
+              if echo "$body" | grep -q "$EXPECTED_SHA"; then
+                echo "anvil-forge healthy on $EXPECTED_SHA"; exit 0
+              fi
+              echo "waiting for health… ($i/20) got: ${body:-nothing}"; sleep 3
+            done
+            echo "::error::anvil-forge did not report sha $EXPECTED_SHA within ~60s"
+            docker logs --tail 50 anvil-forge-1 || true
+            exit 1

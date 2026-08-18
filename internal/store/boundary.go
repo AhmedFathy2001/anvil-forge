@@ -49,7 +49,7 @@ func (s *Store) Promote(ctx context.Context, playerIDs []int64, reason PromoteRe
 	// GREATEST(now(), last_polled_at + floor) is the whole guard: due immediately unless this
 	// player was polled within the last minute, in which case just after that.
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE sweep_state
+		UPDATE forge_sweep_state
 		SET next_poll_at = GREATEST(now(), COALESCE(last_polled_at, 'epoch'::timestamptz) + $2::interval),
 		    tier         = 0,
 		    miss_streak  = 0
@@ -86,7 +86,7 @@ func (s *Store) PromoteMoved(ctx context.Context, playerIDs []int64, since time.
 	}
 
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE sweep_state s
+		UPDATE forge_sweep_state s
 		SET next_poll_at = GREATEST(now(), COALESCE(s.last_polled_at, 'epoch'::timestamptz) + $3::interval),
 		    tier         = 0,
 		    miss_streak  = 0
@@ -118,9 +118,9 @@ func (s *Store) SetEnrolled(ctx context.Context, playerIDs []int64, enrolled boo
 	// A player who becomes enrolled is due immediately — they need a baseline before anything they
 	// do can be scored, and that baseline is the one poll that cannot be deferred.
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO sweep_state (player_id, enrolled, next_poll_at)
+		INSERT INTO forge_sweep_state (player_id, enrolled, next_poll_at)
 		SELECT id, $2, CASE WHEN $2 THEN now() ELSE 'infinity'::timestamptz END
-		FROM players WHERE id = ANY($1)
+		FROM forge_players WHERE id = ANY($1)
 		ON CONFLICT (player_id) DO UPDATE
 		SET enrolled = EXCLUDED.enrolled,
 		    next_poll_at = CASE
@@ -143,7 +143,7 @@ func (s *Store) RecordHeartbeat(ctx context.Context, playerID int64) error {
 		return nil
 	}
 	_, err := s.pool.Exec(ctx,
-		`UPDATE sweep_state SET live_seen_at = now() WHERE player_id = $1`, playerID)
+		`UPDATE forge_sweep_state SET live_seen_at = now() WHERE player_id = $1`, playerID)
 	if err != nil {
 		return fmt.Errorf("recording heartbeat for %d: %w", playerID, err)
 	}

@@ -1,0 +1,56 @@
+# Add to /opt/anvil/docker-compose.yml, alongside caddy and anvil-admin.
+#
+# Forge is a SINGLETON, unlike the clan containers. Its hiscores rate budget is global and cannot be
+# divided across replicas without coordination, so there is exactly one of these per box — which is
+# also why it is a compose service rather than something the control plane provisions per clan.
+#
+# It publishes NO host port. Only Caddy needs to reach it, over the shared anvil_default network.
+
+  anvil-forge:
+    image: ${FORGE_IMAGE:-ghcr.io/ahmedfathy2001/anvil-forge:stable}
+    restart: unless-stopped
+    env_file: ./forge.env
+    # Not Watchtower-managed, for the same reason anvil-admin is not: the CI deploy recreates the
+    # container so env changes actually take effect. Watchtower swaps the image and keeps the old
+    # env, which silently drops them.
+    healthcheck:
+      # The binary has no shell and no curl — distroless on purpose — so the check runs the binary's
+      # own health probe rather than shelling out.
+      test: ["CMD", "/forge", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      - anvil-postgres
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  # The shared Postgres the whole platform moves onto. Named volume, mounted one level above `data`
+  # as Postgres 18 wants so a future pg_upgrade --link does not cross a mount boundary.
+  anvil-postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    env_file: ./postgres.env
+    volumes:
+      - anvil_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anvil"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Tuned for a 62 GB box shared with other services. Left conservative on purpose: Postgres is
+    # about to become the single point of failure for every clan, and headroom is worth more than
+    # throughput we do not yet need.
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=512MB
+      -c max_connections=200
+      -c random_page_cost=1.1
+
+volumes:
+  anvil_pgdata:

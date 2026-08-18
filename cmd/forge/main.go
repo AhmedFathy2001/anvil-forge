@@ -10,10 +10,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,7 +31,18 @@ import (
 	"github.com/anvilosrs/forge/internal/sweep"
 )
 
+// gitSHA is stamped at build time (-ldflags "-X main.gitSHA=..."). Reported on /health so a
+// deploy can be verified from outside without shelling into the box — the question after every
+// rollout is "is the new one actually running", and this is the cheapest possible answer.
+var gitSHA = "dev"
+
 func main() {
+	// Self-probe mode for the container healthcheck. The image is distroless — no shell, no curl —
+	// so the binary has to be able to check itself. Exits 0 if the local HTTP server answers.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(log)
 
@@ -93,6 +106,7 @@ func run(log *slog.Logger) error {
 	}()
 
 	log.Info("forge starting",
+		"sha", gitSHA,
 		"sweep", cfg.EnableSweep,
 		"edge", cfg.EnableEdge,
 		"discord", cfg.EnableDiscord,
@@ -125,6 +139,17 @@ func run(log *slog.Logger) error {
 			if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Error("sweep stopped", "error", err)
 			}
+		}()
+
+		// Derive global player identity from the Site's per-clan memberships.
+		//
+		// Anvil.Site keeps membership per clan, so one account in three clans is three rows with
+		// three independent polling states. Collapsing them is the largest single saving available
+		// on the hiscores budget, and it has to run continuously because rosters change.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reconcileLoop(ctx, db, cfg.ReconcileInterval, log)
 		}()
 
 		// Keep the snapshot partitions ahead of the calendar. Not tidiness: an insert into an
@@ -191,7 +216,7 @@ func registerHealth(mux *http.ServeMux, db *store.Store) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "sha": gitSHA})
 	})
 
 	// Readiness: can we actually do work? This one does check the database, because a Forge that
@@ -247,6 +272,55 @@ func reportEdge(ctx context.Context, s *edge.Server, log *slog.Logger) {
 	}
 }
 
+// reconcileLoop keeps forge_players in step with the Site's rosters.
+//
+// Runs immediately then on an interval: a Forge that has just started with an empty mapping would
+// otherwise sit idle until the first tick, which at a long interval looks exactly like a broken
+// sweep.
+func reconcileLoop(ctx context.Context, db *store.Store, every time.Duration, log *slog.Logger) {
+	run := func() {
+		r, err := db.Reconcile(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Error("reconciling players", "error", err)
+			}
+			return
+		}
+		players, memberships, err := db.Fanout(ctx)
+		if err != nil {
+			log.Warn("reading fanout", "error", err)
+		}
+		// dedup is the number that says whether the global identity is earning its complexity —
+		// and the honest denominator for any claim about the polling budget.
+		dedup := 1.0
+		if players > 0 {
+			dedup = float64(memberships) / float64(players)
+		}
+		log.Info("reconcile",
+			"playersUpserted", r.PlayersInserted,
+			"linksUpserted", r.LinksInserted,
+			"linksPruned", r.LinksPruned,
+			"enrolled", r.Enrolled,
+			"unenrolled", r.Unenrolled,
+			"accounts", players,
+			"memberships", memberships,
+			"dedup", round2(dedup),
+		)
+	}
+
+	run()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			run()
+		}
+	}
+}
+
 func everyDay(ctx context.Context, fn func()) {
 	t := time.NewTicker(24 * time.Hour)
 	defer t.Stop()
@@ -261,6 +335,33 @@ func everyDay(ctx context.Context, fn func()) {
 }
 
 func round2(f float64) float64 { return float64(int(f*100+0.5)) / 100 }
+
+// healthcheck hits our own /health and reports 0 for healthy, 1 otherwise.
+//
+// Deliberately checks LIVENESS, not readiness: a container killed because Postgres blipped is a
+// container restarting at the exact moment restarting helps least.
+func healthcheck() int {
+	addr := os.Getenv("FORGE_HTTP_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + addr + "/health")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: status %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
+}
 
 func logLevel() slog.Level {
 	switch os.Getenv("FORGE_LOG_LEVEL") {

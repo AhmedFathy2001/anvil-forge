@@ -55,8 +55,8 @@ func (s *Store) BoundPayload(ctx context.Context, tokenHash []byte, kind string)
 	var p Payload
 	err := s.pool.QueryRow(ctx, `
 		SELECT pp.etag, pp.body, pp.encoding
-		FROM plugin_bindings pb
-		JOIN plugin_payloads pp ON pp.etag = pb.etag
+		FROM forge_plugin_bindings pb
+		JOIN forge_plugin_payloads pp ON pp.etag = pb.etag
 		WHERE pb.token_hash = $1 AND pb.kind = $2`,
 		tokenHash, kind).Scan(&p.ETag, &p.Body, &p.Encoding)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -73,8 +73,8 @@ func (s *Store) PublicPayload(ctx context.Context, scopeKey string) (*Payload, e
 	var p Payload
 	err := s.pool.QueryRow(ctx, `
 		SELECT pp.etag, pp.body, pp.encoding
-		FROM plugin_public_payloads ppp
-		JOIN plugin_payloads pp ON pp.etag = ppp.etag
+		FROM forge_plugin_public_payloads ppp
+		JOIN forge_plugin_payloads pp ON pp.etag = ppp.etag
 		WHERE ppp.scope_key = $1`,
 		scopeKey).Scan(&p.ETag, &p.Body, &p.Encoding)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -108,7 +108,7 @@ func (s *Store) Authenticate(ctx context.Context, token string) (*Caller, error)
 	c := Caller{TokenHash: hash}
 	err := s.pool.QueryRow(ctx, `
 		SELECT player_id, subject
-		FROM plugin_credentials
+		FROM forge_plugin_credentials
 		WHERE token_hash = $1 AND revoked_at IS NULL`,
 		hash).Scan(&c.PlayerID, &c.Subject)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -127,7 +127,7 @@ func (s *Store) Authenticate(ctx context.Context, token string) (*Caller, error)
 // that is the difference between a few writes a second and a few thousand.
 func (s *Store) TouchSeen(ctx context.Context, tokenHash []byte, interval time.Duration) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE plugin_credentials
+		UPDATE forge_plugin_credentials
 		SET last_seen_at = now()
 		WHERE token_hash = $1
 		  AND (last_seen_at IS NULL OR last_seen_at < now() - $2::interval)`,
@@ -149,7 +149,7 @@ func (s *Store) Ingest(ctx context.Context, c *Caller, kind string, payload json
 	}
 
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO plugin_ingest_events (player_id, subject, kind, payload, dedupe_key)
+		INSERT INTO forge_plugin_ingest_events (player_id, subject, kind, payload, dedupe_key)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,
 		c.PlayerID, c.Subject, kind, payload, key)
@@ -162,10 +162,10 @@ func (s *Store) Ingest(ctx context.Context, c *Caller, kind string, payload json
 // Heartbeat stamps the player as online, which is the strongest signal the sweep ever gets.
 //
 // Separate from Ingest because it is far more frequent and carries no payload worth storing — the
-// only fact is "this player is logged in right now", and the sweep reads it from sweep_state.
+// only fact is "this player is logged in right now", and the sweep reads it from forge_sweep_state.
 func (s *Store) Heartbeat(ctx context.Context, playerID int64) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE sweep_state SET live_seen_at = now() WHERE player_id = $1`, playerID)
+		`UPDATE forge_sweep_state SET live_seen_at = now() WHERE player_id = $1`, playerID)
 	if err != nil {
 		return fmt.Errorf("recording heartbeat for %d: %w", playerID, err)
 	}

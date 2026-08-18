@@ -1,5 +1,5 @@
 -- Forge owns player identity and hiscores tracking. Anvil.Site owns clans, events, tiles, teams,
--- scoring — and references players(id).
+-- scoring — and references forge_players(id).
 --
 -- The split exists because these tables have a completely different access pattern from the domain
 -- ones: a few hundred writes a second from one process, no human ever editing them, and a row count
@@ -20,7 +20,7 @@ BEGIN;
 
 -- One row per OSRS account, for the whole platform. NOT per clan: a player who guests in four
 -- clans is one row here and four membership rows over in the Site's schema.
-CREATE TABLE players (
+CREATE TABLE forge_players (
   id              bigserial PRIMARY KEY,
 
   -- The strong identity key, captured during the plugin handshake. Survives renames, which RSN
@@ -50,7 +50,7 @@ CREATE TABLE players (
   status_checked_at timestamptz
 );
 
-COMMENT ON TABLE players IS
+COMMENT ON TABLE forge_players IS
   'Global OSRS account identity. One row per account across every clan on the platform.';
 
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -59,8 +59,8 @@ COMMENT ON TABLE players IS
 
 -- Current stats, updated IN PLACE. One row per player, forever — this table never grows with time,
 -- only with the playerbase. Every leaderboard read hits this and never touches the history table.
-CREATE TABLE player_current (
-  player_id     bigint PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+CREATE TABLE forge_player_current (
+  player_id     bigint PRIMARY KEY REFERENCES forge_players(id) ON DELETE CASCADE,
   snapshot      jsonb  NOT NULL,          -- the full hiscores read, same shape as Anvil.Site's
   overall_xp    bigint NOT NULL,          -- promoted out of the blob: it is the change detector
   captured_at   timestamptz NOT NULL
@@ -75,30 +75,30 @@ CREATE TABLE player_current (
 -- actually played".
 --
 -- Partitioned by month so retention is a DROP TABLE rather than a DELETE that has to be vacuumed.
-CREATE TABLE player_snapshots (
+CREATE TABLE forge_player_snapshots (
   id            bigserial,
-  player_id     bigint NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  player_id     bigint NOT NULL REFERENCES forge_players(id) ON DELETE CASCADE,
   captured_at   timestamptz NOT NULL,
   overall_xp    bigint NOT NULL,
   snapshot      jsonb  NOT NULL,
   PRIMARY KEY (id, captured_at)
 ) PARTITION BY RANGE (captured_at);
 
-CREATE INDEX player_snapshots_player_time_idx ON player_snapshots (player_id, captured_at DESC);
+CREATE INDEX forge_player_snapshots_player_time_idx ON forge_player_snapshots (player_id, captured_at DESC);
 
 -- Creates the partition covering a given month, if it does not exist. Call from a monthly job and
 -- once at boot — an insert into a range with no partition is a hard error, so this must run AHEAD
 -- of the month it covers, not during it.
-CREATE OR REPLACE FUNCTION ensure_snapshot_partition(for_month date)
+CREATE OR REPLACE FUNCTION forge_ensure_snapshot_partition(for_month date)
 RETURNS void AS $$
 DECLARE
   start_at date := date_trunc('month', for_month)::date;
   end_at   date := (date_trunc('month', for_month) + interval '1 month')::date;
-  part     text := 'player_snapshots_' || to_char(start_at, 'YYYY_MM');
+  part     text := 'forge_player_snapshots_' || to_char(start_at, 'YYYY_MM');
 BEGIN
   IF to_regclass(part) IS NULL THEN
     EXECUTE format(
-      'CREATE TABLE %I PARTITION OF player_snapshots FOR VALUES FROM (%L) TO (%L)',
+      'CREATE TABLE %I PARTITION OF forge_player_snapshots FOR VALUES FROM (%L) TO (%L)',
       part, start_at, end_at
     );
   END IF;
@@ -106,9 +106,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- This month and the next two, so a boot never lands in an uncovered range.
-SELECT ensure_snapshot_partition(CURRENT_DATE);
-SELECT ensure_snapshot_partition((CURRENT_DATE + interval '1 month')::date);
-SELECT ensure_snapshot_partition((CURRENT_DATE + interval '2 months')::date);
+SELECT forge_ensure_snapshot_partition(CURRENT_DATE);
+SELECT forge_ensure_snapshot_partition((CURRENT_DATE + interval '1 month')::date);
+SELECT forge_ensure_snapshot_partition((CURRENT_DATE + interval '2 months')::date);
 
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
 -- The scheduler
@@ -119,8 +119,8 @@ SELECT ensure_snapshot_partition((CURRENT_DATE + interval '2 months')::date);
 -- Deliberately denormalised: the claim query runs many times a second and must be a single-table
 -- index scan with no joins into the Site's domain tables. `enrolled` and `live_seen_at` are pushed
 -- here by the Site rather than derived at claim time.
-CREATE TABLE sweep_state (
-  player_id       bigint PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+CREATE TABLE forge_sweep_state (
+  player_id       bigint PRIMARY KEY REFERENCES forge_players(id) ON DELETE CASCADE,
 
   -- The queue position. Everything in this file exists to compute this one column well.
   next_poll_at    timestamptz NOT NULL DEFAULT now(),
@@ -157,10 +157,10 @@ CREATE TABLE sweep_state (
 -- THE index. Partial on `enrolled` so it covers only pollable rows: at 2M players with 1.2M
 -- enrolled, that is 40% less index to walk on every claim, and the non-enrolled majority costs
 -- nothing to carry.
-CREATE INDEX sweep_state_due_idx ON sweep_state (next_poll_at) WHERE enrolled;
+CREATE INDEX forge_sweep_state_due_idx ON forge_sweep_state (next_poll_at) WHERE enrolled;
 
 -- For the dormancy reporting the admin UI shows clan staff ("your roster is 40% ghosts").
-CREATE INDEX sweep_state_tier_idx ON sweep_state (tier) WHERE enrolled;
+CREATE INDEX forge_sweep_state_tier_idx ON forge_sweep_state (tier) WHERE enrolled;
 
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
 -- The outbox
@@ -173,9 +173,9 @@ CREATE INDEX sweep_state_tier_idx ON sweep_state (tier) WHERE enrolled;
 -- deathless / diary / ca / clog / mission…) from having to exist in two languages. It also means a
 -- scoring bug is replayable: the events are durable, so the Site can re-consume a range after a fix
 -- instead of the evidence being gone.
-CREATE TABLE player_events (
+CREATE TABLE forge_player_events (
   id           bigserial PRIMARY KEY,
-  player_id    bigint NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  player_id    bigint NOT NULL REFERENCES forge_players(id) ON DELETE CASCADE,
 
   -- 'snapshot.changed' — new stats, payload carries the deltas
   -- 'player.unranked'  — hiscores 404, payload carries the RSN tried
@@ -189,7 +189,7 @@ CREATE TABLE player_events (
 
 -- The consumer's cursor. Partial so the index shrinks as events are consumed rather than growing
 -- forever alongside the table.
-CREATE INDEX player_events_unconsumed_idx ON player_events (id) WHERE consumed_at IS NULL;
+CREATE INDEX forge_player_events_unconsumed_idx ON forge_player_events (id) WHERE consumed_at IS NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
 -- Observability
@@ -198,7 +198,7 @@ CREATE INDEX player_events_unconsumed_idx ON player_events (id) WHERE consumed_a
 -- One row per sweep tick. Small, bounded by a retention job, and the first thing to look at when
 -- the question is "why is the leaderboard stale" — it distinguishes "we are rate limited", "we are
 -- behind", and "nobody is playing", which otherwise look identical from the outside.
-CREATE TABLE sweep_runs (
+CREATE TABLE forge_sweep_runs (
   id              bigserial PRIMARY KEY,
   started_at      timestamptz NOT NULL DEFAULT now(),
   finished_at     timestamptz,
@@ -214,6 +214,6 @@ CREATE TABLE sweep_runs (
   shadow          boolean NOT NULL DEFAULT false
 );
 
-CREATE INDEX sweep_runs_started_idx ON sweep_runs (started_at DESC);
+CREATE INDEX forge_sweep_runs_started_idx ON forge_sweep_runs (started_at DESC);
 
 COMMIT;

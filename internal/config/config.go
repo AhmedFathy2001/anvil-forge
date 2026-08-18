@@ -41,6 +41,10 @@ type Config struct {
 	// worker costs its players this much delay and nothing else.
 	ClaimLease time.Duration
 
+	// ReconcileInterval is how often global player identity is re-derived from the Site's rosters.
+	// Minutes, not seconds: rosters change on human timescales, and the queries scan clan_members.
+	ReconcileInterval time.Duration
+
 	// TickInterval is how often the runner looks for due players. Not the polling cadence — that
 	// is per player, from the ladder.
 	TickInterval time.Duration
@@ -78,16 +82,17 @@ type Config struct {
 // Load reads configuration from the environment, applying defaults sized for a single box.
 func Load() (*Config, error) {
 	c := &Config{
-		DatabaseURL:   os.Getenv("DATABASE_URL"),
-		HiscoresRPS:   envFloat("FORGE_HISCORES_RPS", 5),
-		HiscoresBurst: envInt("FORGE_HISCORES_BURST", 10),
-		Workers:       envInt("FORGE_WORKERS", 8),
-		ClaimBatch:    envInt("FORGE_CLAIM_BATCH", 200),
-		ClaimLease:    envDuration("FORGE_CLAIM_LEASE", 5*time.Minute),
-		TickInterval:  envDuration("FORGE_TICK_INTERVAL", 10*time.Second),
-		UserAgent:     envStr("FORGE_USER_AGENT", "Anvil.Forge/1.0 (+https://anvilosrs.com; contact@anvilosrs.com)"),
-		DryRun:        envBool("FORGE_DRY_RUN", false),
-		HTTPAddr:      envStr("FORGE_HTTP_ADDR", ":8080"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		HiscoresRPS:       envFloat("FORGE_HISCORES_RPS", 5),
+		HiscoresBurst:     envInt("FORGE_HISCORES_BURST", 10),
+		Workers:           envInt("FORGE_WORKERS", 8),
+		ClaimBatch:        envInt("FORGE_CLAIM_BATCH", 200),
+		ClaimLease:        envDuration("FORGE_CLAIM_LEASE", 5*time.Minute),
+		TickInterval:      envDuration("FORGE_TICK_INTERVAL", 10*time.Second),
+		ReconcileInterval: envDuration("FORGE_RECONCILE_INTERVAL", 5*time.Minute),
+		UserAgent:         envStr("FORGE_USER_AGENT", "Anvil.Forge/1.0 (+https://anvilosrs.com; contact@anvilosrs.com)"),
+		DryRun:            envBool("FORGE_DRY_RUN", false),
+		HTTPAddr:          envStr("FORGE_HTTP_ADDR", ":8080"),
 
 		EnableSweep:   envBool("FORGE_ENABLE_SWEEP", true),
 		EnableEdge:    envBool("FORGE_ENABLE_EDGE", true),

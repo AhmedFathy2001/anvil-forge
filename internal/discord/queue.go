@@ -44,7 +44,7 @@ func BucketFor(webhookURL string) string {
 func (q *Queue) Enqueue(ctx context.Context, webhookURL string, payload json.RawMessage, dedupeKey string, priority int16) (int64, error) {
 	var id int64
 	err := q.pool.QueryRow(ctx, `
-		INSERT INTO discord_deliveries (webhook_url, bucket, payload, dedupe_key, priority)
+		INSERT INTO forge_discord_deliveries (webhook_url, bucket, payload, dedupe_key, priority)
 		VALUES ($1, $2, $3, NULLIF($4, ''), $5)
 		ON CONFLICT (dedupe_key) DO NOTHING
 		RETURNING id`,
@@ -66,12 +66,12 @@ func (q *Queue) Enqueue(ctx context.Context, webhookURL string, payload json.Raw
 // does, so a crashed worker's messages become due again rather than being stuck in 'delivering'.
 func (q *Queue) Claim(ctx context.Context, limit int, lease time.Duration) ([]Delivery, error) {
 	rows, err := q.pool.Query(ctx, `
-		UPDATE discord_deliveries d
+		UPDATE forge_discord_deliveries d
 		SET status = 'delivering',
 		    next_attempt_at = now() + $2::interval,
 		    attempts = d.attempts + 1
 		FROM (
-		  SELECT id FROM discord_deliveries
+		  SELECT id FROM forge_discord_deliveries
 		  WHERE status IN ('pending', 'failed') AND next_attempt_at <= now()
 		  ORDER BY priority DESC, next_attempt_at
 		  LIMIT $1
@@ -101,7 +101,7 @@ func (q *Queue) Complete(ctx context.Context, d Delivery, res Result) error {
 	switch res.Verdict {
 	case VerdictDelivered:
 		_, err := q.pool.Exec(ctx, `
-			UPDATE discord_deliveries
+			UPDATE forge_discord_deliveries
 			SET status = 'delivered', delivered_at = now(), last_status = $2, last_error = NULL
 			WHERE id = $1`, d.ID, res.Status)
 		return wrap(err, "marking delivered", d.ID)
@@ -111,14 +111,14 @@ func (q *Queue) Complete(ctx context.Context, d Delivery, res Result) error {
 		// so an admin surface can say "these 40 messages failed because your webhook was deleted"
 		// instead of the clan simply noticing that Discord went quiet.
 		_, err := q.pool.Exec(ctx, `
-			UPDATE discord_deliveries
+			UPDATE forge_discord_deliveries
 			SET status = 'dead', last_status = $2, last_error = $3
 			WHERE id = $1`, d.ID, res.Status, errText(res.Err))
 		return wrap(err, "marking dead", d.ID)
 
 	case VerdictDrop:
 		_, err := q.pool.Exec(ctx, `
-			UPDATE discord_deliveries
+			UPDATE forge_discord_deliveries
 			SET status = 'failed', last_status = $2, last_error = $3,
 			    next_attempt_at = 'infinity'::timestamptz
 			WHERE id = $1`, d.ID, res.Status, errText(res.Err))
@@ -127,7 +127,7 @@ func (q *Queue) Complete(ctx context.Context, d Delivery, res Result) error {
 	default: // retry
 		if d.Attempts >= MaxAttempts {
 			_, err := q.pool.Exec(ctx, `
-				UPDATE discord_deliveries
+				UPDATE forge_discord_deliveries
 				SET status = 'failed', last_status = $2, last_error = $3,
 				    next_attempt_at = 'infinity'::timestamptz
 				WHERE id = $1`, d.ID, res.Status, errText(res.Err))
@@ -139,7 +139,7 @@ func (q *Queue) Complete(ctx context.Context, d Delivery, res Result) error {
 			delay = Backoff(d.Attempts)
 		}
 		_, err := q.pool.Exec(ctx, `
-			UPDATE discord_deliveries
+			UPDATE forge_discord_deliveries
 			SET status = 'pending', next_attempt_at = now() + $2::interval,
 			    last_status = $3, last_error = $4
 			WHERE id = $1`, d.ID, delay.String(), res.Status, errText(res.Err))
@@ -166,7 +166,7 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		  count(*) FILTER (WHERE status = 'dead'),
 		  count(*) FILTER (WHERE status = 'failed'),
 		  min(created_at) FILTER (WHERE status IN ('pending','delivering'))
-		FROM discord_deliveries`).Scan(&s.Pending, &s.Dead, &s.Failed, &oldest)
+		FROM forge_discord_deliveries`).Scan(&s.Pending, &s.Dead, &s.Failed, &oldest)
 	if err != nil {
 		return s, fmt.Errorf("reading queue stats: %w", err)
 	}
@@ -181,7 +181,7 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 // the fastest-growing table in the database.
 func (q *Queue) Prune(ctx context.Context, keepDelivered time.Duration) (int64, error) {
 	tag, err := q.pool.Exec(ctx, `
-		DELETE FROM discord_deliveries
+		DELETE FROM forge_discord_deliveries
 		WHERE status = 'delivered' AND delivered_at < now() - $1::interval`, keepDelivered.String())
 	if err != nil {
 		return 0, fmt.Errorf("pruning deliveries: %w", err)

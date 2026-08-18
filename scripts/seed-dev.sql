@@ -4,7 +4,7 @@
 --
 --   psql "$DATABASE_URL" -f scripts/seed-dev.sql
 
-INSERT INTO players (rsn, rsn_normalized) VALUES
+INSERT INTO forge_players (rsn, rsn_normalized) VALUES
   ('Lynx Titan',   'lynx titan'),
   ('Zezima',       'zezima'),
   ('Woox',         'woox'),
@@ -20,9 +20,9 @@ INSERT INTO players (rsn, rsn_normalized) VALUES
 ON CONFLICT (rsn_normalized) DO NOTHING;
 
 -- Everyone enrolled and due immediately, so a local run has work the moment it starts.
-INSERT INTO sweep_state (player_id, enrolled, next_poll_at)
-SELECT id, true, now() FROM players
+INSERT INTO forge_sweep_state (player_id, enrolled, next_poll_at)
+SELECT id, true, now() FROM forge_players
 ON CONFLICT (player_id) DO UPDATE SET enrolled = true, next_poll_at = now();
 
-SELECT count(*) AS seeded_players FROM players;
-SELECT count(*) AS due_now FROM sweep_state WHERE enrolled AND next_poll_at <= now();
+SELECT count(*) AS seeded_players FROM forge_players;
+SELECT count(*) AS due_now FROM forge_sweep_state WHERE enrolled AND next_poll_at <= now();

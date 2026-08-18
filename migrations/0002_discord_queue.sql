@@ -11,7 +11,7 @@
 
 BEGIN;
 
-CREATE TABLE discord_deliveries (
+CREATE TABLE forge_discord_deliveries (
   id            bigserial PRIMARY KEY,
 
   -- Which webhook to post to. Stored rather than referenced because the Site owns webhook config
@@ -53,16 +53,16 @@ CREATE TABLE discord_deliveries (
 
 -- The claim index: partial on the only status a worker ever looks for, so it stays small even as
 -- delivered rows accumulate ahead of the retention sweep.
-CREATE INDEX discord_deliveries_claim_idx
-  ON discord_deliveries (priority DESC, next_attempt_at)
+CREATE INDEX forge_discord_deliveries_claim_idx
+  ON forge_discord_deliveries (priority DESC, next_attempt_at)
   WHERE status IN ('pending', 'failed');
 
 -- For the admin surface that tells a clan their webhook is dead.
-CREATE INDEX discord_deliveries_dead_idx ON discord_deliveries (bucket, created_at DESC)
+CREATE INDEX forge_discord_deliveries_dead_idx ON forge_discord_deliveries (bucket, created_at DESC)
   WHERE status = 'dead';
 
 -- Retention: delivered rows are only interesting for a short while.
-CREATE INDEX discord_deliveries_delivered_idx ON discord_deliveries (delivered_at)
+CREATE INDEX forge_discord_deliveries_delivered_idx ON forge_discord_deliveries (delivered_at)
   WHERE status = 'delivered';
 
 COMMIT;
