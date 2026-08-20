@@ -32,23 +32,22 @@ into an inbox table the Site consumes — the same pattern as `player_events` an
 `plugin_ingest_events`. The *outbound* direction, which is what most features actually need, is
 already covered by the delivery queue in step 5.
 
-### How this fits the Site's actual schema
+### How this fits the Site's schema
 
-The multi-clan preview makes **clans** rows but keeps membership **per clan**: `clan_members` is
-unique on `(clan_id, rsn_normalized)`, so one OSRS account in three clans is three rows, each with
-its own `stats_next_due_at` / `stats_last_snapshot` / `live_stats`. Polled naively that is three
-hiscores requests for one account, which at a 5 req/s budget is the most expensive mistake
-available.
+The multi-clan rework (`feat/drop-federation`) landed global identity, so Forge no longer has to
+invent any:
 
-Forge does not wait for the Site to adopt global identity — it **derives it**. `Reconcile` collapses
-every distinct account across every clan into one `forge_players` row and maps it to each membership
-it came from (`forge_player_clans`). One poll, fanned out. When the Site eventually unifies identity,
-that mapping is what the migration reads.
+- **`players`** is a *person*. **`accounts`** is a global OSRS account — `rsn_normalized` and
+  `account_hash` both UNIQUE, hiscores state on the row, and `accounts_due_idx` already built.
+- **`clan_memberships`** is the seat: `(clan_id, account_id)`. One account in three clans is three
+  seats and **one** poll, which was the whole point.
 
-All Forge tables are prefixed `forge_` because the Site already owns tables called `players` (its
-per-event bingo participants) and `player_snapshots`, with entirely different meanings.
+So Forge's earlier `forge_players` + `Reconcile` — which existed only to derive global identity from
+per-clan membership — are deleted. Keeping a shadow identity table alongside `accounts` would have
+been two sources of truth for "who is this account".
 
-Step 5 is independent of all of this and could be pointed at production today.
+Forge writes `accounts.stats_*` exactly as `/api/cron/stats` does, so every existing read path keeps
+working and rollback is turning Forge off.
 
 ## Running it locally
 

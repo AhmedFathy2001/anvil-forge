@@ -1,4 +1,8 @@
 // Package store is Forge's Postgres access layer.
+//
+// Same database as Anvil.Site. Forge is a second process, not a second datastore — so the sweep's
+// output goes into the columns the Site already reads (`accounts.stats_*`), and the only tables
+// Forge adds are for things that have no home in the Site's schema at all.
 package store
 
 import (
@@ -6,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +18,14 @@ import (
 
 	"github.com/anvilosrs/forge/internal/hiscores"
 )
+
+// siteTime is the format Anvil.Site stores its text timestamps in.
+//
+// The Site keeps most timestamps as TEXT rather than timestamptz, in two different shapes depending
+// on who wrote them (a SQLite-era space-separated form and a JS ISO one). Forge writes the form the
+// Site's own SQL default produces, so a column stays internally consistent whichever process filled
+// it — a mixed column is what makes date comparisons silently wrong rather than loudly broken.
+const siteTime = "2006-01-02 15:04:05"
 
 // Store owns the pool. Safe for concurrent use.
 type Store struct {
@@ -28,8 +41,9 @@ func Open(ctx context.Context, databaseURL string, dryRun bool) (*Store, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parsing DATABASE_URL: %w", err)
 	}
-	// Sized for the sweep's shape: short transactions, lots of them. The pool is the backstop
-	// against a stall turning into connection exhaustion for everything else on the database.
+	// Sized for the sweep's shape: short transactions, lots of them. Also a backstop — Forge shares
+	// this database with every clan container, so a stall here must not exhaust connections for the
+	// app people are actually looking at.
 	if cfg.MaxConns < 8 {
 		cfg.MaxConns = 8
 	}
@@ -50,52 +64,58 @@ func Open(ctx context.Context, databaseURL string, dryRun bool) (*Store, error) 
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
-// Pool exposes the underlying pool for health checks.
+// Pool exposes the underlying pool for health checks and the edge.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
-// Claim is one player leased for polling.
+// Claim is one account leased for polling.
 type Claim struct {
-	PlayerID    int64
+	AccountID   int64
 	Rsn         string
 	MissStreak  int
 	ErrorStreak int
 	LiveSeenAt  time.Time
 	// PrevOverallXp is the change detector, read at claim time so the common case — a poll that
-	// finds nothing new — never has to load the previous snapshot blob at all. At 2M players and a
-	// ~6 KB snapshot each, loading blobs speculatively would move gigabytes a day to learn nothing.
+	// finds nothing new — never loads the previous snapshot blob at all. A snapshot is ~6 KB; at
+	// scale, fetching them speculatively would move gigabytes a day to learn nobody played.
 	PrevOverallXp int64
-	// HasPrevious is false for a player we have never successfully polled.
-	HasPrevious bool
+	HasPrevious   bool
+	// LiveStats is the plugin's absolute-value overlay, reconciled against fresh hiscores below.
+	LiveStats []byte
+	// LiveStatKeyTimes is the per-key last-rose map, which is what makes the stale-overlay prune
+	// possible: without it a bogus push stuck ABOVE the hiscores can never be retired.
+	LiveStatKeyTimes []byte
 }
 
-// ClaimDue leases up to `limit` players whose next poll is due, skipping rows another worker holds.
+// ClaimDue leases up to `limit` accounts whose next poll is due, skipping rows another worker holds.
 //
-// The lease is written into next_poll_at rather than tracked separately, so there is exactly one
-// column deciding queue position and a crashed worker self-heals: its players simply become due
-// again when the lease elapses. The real next_poll_at is written afterwards by ApplyResult.
+// The lease is written into stats_next_due_at rather than tracked separately, so exactly one column
+// decides queue position and a crashed worker self-heals: its accounts simply become due again when
+// the lease elapses. The real next-due is written afterwards by Apply.
+//
+// NULL stats_next_due_at means "due now" — that is the Site's existing convention and the reason a
+// freshly enrolled account is picked up on the very next tick.
 func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]Claim, error) {
 	const q = `
-		UPDATE forge_sweep_state s
-		SET next_poll_at = now() + $2::interval,
-		    claimed_at   = now()
+		UPDATE accounts a
+		SET stats_next_due_at = to_char(now() at time zone 'utc' + $2::interval, 'YYYY-MM-DD HH24:MI:SS'),
+		    sweep_claimed_at  = now()
 		FROM (
-		  SELECT player_id
-		  FROM forge_sweep_state
-		  WHERE enrolled AND next_poll_at <= now()
-		  ORDER BY next_poll_at
+		  SELECT id FROM accounts
+		  WHERE sweep_enrolled
+		    AND status = 'active'
+		    AND (stats_next_due_at IS NULL
+		         OR stats_next_due_at <= to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+		  ORDER BY stats_next_due_at NULLS FIRST
 		  LIMIT $1
 		  FOR UPDATE SKIP LOCKED
 		) due
-		JOIN forge_players p ON p.id = due.player_id
-		LEFT JOIN forge_player_current pc ON pc.player_id = due.player_id
-		WHERE s.player_id = due.player_id
-		  AND p.status = 'active'
-		RETURNING s.player_id, p.rsn, s.miss_streak, s.error_streak,
-		          s.live_seen_at, pc.overall_xp`
+		WHERE a.id = due.id
+		RETURNING a.id, a.rsn, a.stats_miss_streak, a.sweep_error_streak,
+		          a.sweep_live_seen_at, a.stats_overall_xp, a.live_stats, a.live_stat_key_times`
 
 	rows, err := s.pool.Query(ctx, q, limit, lease.String())
 	if err != nil {
-		return nil, fmt.Errorf("claiming due players: %w", err)
+		return nil, fmt.Errorf("claiming due accounts: %w", err)
 	}
 	defer rows.Close()
 
@@ -104,7 +124,9 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 		var c Claim
 		var liveSeen *time.Time
 		var prevXp *int64
-		if err := rows.Scan(&c.PlayerID, &c.Rsn, &c.MissStreak, &c.ErrorStreak, &liveSeen, &prevXp); err != nil {
+		var liveStats, keyTimes *string
+		if err := rows.Scan(&c.AccountID, &c.Rsn, &c.MissStreak, &c.ErrorStreak,
+			&liveSeen, &prevXp, &liveStats, &keyTimes); err != nil {
 			return nil, fmt.Errorf("scanning claim: %w", err)
 		}
 		if liveSeen != nil {
@@ -114,36 +136,44 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 			c.PrevOverallXp = *prevXp
 			c.HasPrevious = true
 		}
+		if liveStats != nil {
+			c.LiveStats = []byte(*liveStats)
+		}
+		if keyTimes != nil {
+			c.LiveStatKeyTimes = []byte(*keyTimes)
+		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
-// Backlog counts players who are due but were not claimed. Sustained non-zero means the polling
-// budget is smaller than the enrolled population — the signal to widen the ladder rather than to
-// raise the request rate.
+// Backlog counts accounts due but not claimed. Sustained non-zero means the enrolled population has
+// outgrown the request budget — the signal to widen the ladder rather than to raise the rate.
 func (s *Store) Backlog(ctx context.Context) (int, error) {
 	var n int
-	err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM forge_sweep_state WHERE enrolled AND next_poll_at <= now()`).Scan(&n)
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM accounts
+		WHERE sweep_enrolled AND status = 'active'
+		  AND (stats_next_due_at IS NULL
+		       OR stats_next_due_at <= to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))`).Scan(&n)
 	return n, err
 }
 
-// PreviousSnapshot loads a player's last stored snapshot, for the delta computation. Only called
+// PreviousSnapshot loads an account's last stored snapshot, for the delta computation. Only called
 // when a change was detected, which is the minority of polls.
-func (s *Store) PreviousSnapshot(ctx context.Context, playerID int64) (*hiscores.Snapshot, error) {
-	var raw []byte
+func (s *Store) PreviousSnapshot(ctx context.Context, accountID int64) (*hiscores.Snapshot, error) {
+	var raw *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT snapshot FROM forge_player_current WHERE player_id = $1`, playerID).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) {
+		`SELECT stats_last_snapshot FROM accounts WHERE id = $1`, accountID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) || raw == nil {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("loading previous snapshot for %d: %w", playerID, err)
+		return nil, fmt.Errorf("loading previous snapshot for %d: %w", accountID, err)
 	}
 	var snap hiscores.Snapshot
-	if err := json.Unmarshal(raw, &snap); err != nil {
-		// A corrupt blob must not fail the tick — treat it as a first sighting. The player loses
+	if err := json.Unmarshal([]byte(*raw), &snap); err != nil {
+		// A corrupt blob must not fail the tick — treat it as a first sighting. The account loses
 		// one tick's deltas, which is strictly better than the sweep stalling on one bad row.
 		return nil, nil
 	}
@@ -152,8 +182,8 @@ func (s *Store) PreviousSnapshot(ctx context.Context, playerID int64) (*hiscores
 
 // Outcome records everything one poll produced.
 type Outcome struct {
-	PlayerID int64
-	Rsn      string
+	AccountID int64
+	Rsn       string
 
 	// Fetch classification: "ok", "unranked", or "transient".
 	Kind string
@@ -166,114 +196,151 @@ type Outcome struct {
 	Reason      string
 
 	// Set only when Kind is "ok" and the snapshot differed from the stored one.
-	Changed    bool
-	Snapshot   *hiscores.Snapshot
-	OverallXp  int64
-	Deltas     hiscores.Deltas
+	Changed   bool
+	Snapshot  *hiscores.Snapshot
+	OverallXp int64
+	Deltas    hiscores.Deltas
+
+	// LiveStats is the reconciled overlay to persist, and LiveStatsChanged whether it differs from
+	// what was stored. Nil map with Changed=true clears the column.
+	LiveStats        map[string]int64
+	LiveStatsChanged bool
+
 	CapturedAt time.Time
 }
 
-// Apply writes one poll's result: the ladder decision always, and — when something actually
-// changed — the new snapshot, a history row, and an outbox event for the Site to score.
+// Apply writes one poll's result.
 //
-// All of it in one transaction, because a snapshot written without its event would be silently
-// unscored, and an event without its snapshot would point at stats that are not there.
-func (s *Store) Apply(ctx context.Context, o Outcome) error {
+// The scheduling columns always; the stats columns when something moved; an outbox event so the
+// Site can score it. One transaction, because a snapshot written without its event would be
+// silently unscored, and an event without its snapshot would point at stats that are not there.
+func (s *Store) Apply(ctx context.Context, o Outcome) (overflowed bool, err error) {
 	if s.DryRun {
-		return nil
+		return false, nil
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return false, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, err = tx.Exec(ctx, `
-		UPDATE forge_sweep_state
-		SET next_poll_at   = $2,
-		    tier           = $3,
-		    miss_streak    = $4,
-		    error_streak   = $5,
-		    last_polled_at = now(),
-		    last_outcome   = $6,
-		    last_change_at = CASE WHEN $7 THEN now() ELSE last_change_at END,
-		    claimed_at     = NULL
-		WHERE player_id = $1`,
-		o.PlayerID, o.NextPollAt, o.Tier, o.MissStreak, o.ErrorStreak, o.Kind, o.Changed)
-	if err != nil {
-		return fmt.Errorf("updating sweep_state for %d: %w", o.PlayerID, err)
+	nextDue := o.NextPollAt.UTC().Format(siteTime)
+
+	// The scheduling half. Written on every outcome, including failures — that is what moves the
+	// account out of the queue head instead of it being re-claimed immediately.
+	if _, err := tx.Exec(ctx, `
+		UPDATE accounts
+		SET stats_next_due_at  = $2,
+		    stats_miss_streak  = $3,
+		    sweep_tier         = $4,
+		    sweep_error_streak = $5,
+		    sweep_claimed_at   = NULL
+		WHERE id = $1`,
+		o.AccountID, nextDue, o.MissStreak, o.Tier, o.ErrorStreak); err != nil {
+		return overflowed, fmt.Errorf("updating schedule for %d: %w", o.AccountID, err)
 	}
 
 	switch o.Kind {
 	case "unranked":
-		// Take them out of the sweep entirely. Without this one renamed account 404s every tick
-		// forever and steals a slot from a healthy row.
+		// Take them out of the sweep. Without this, one renamed account 404s every tick forever and
+		// steals a slot from a healthy row. A re-probe job lifts them back.
 		if _, err := tx.Exec(ctx, `
-			UPDATE forge_players SET status = 'unranked', status_checked_at = now()
-			WHERE id = $1 AND status = 'active'`, o.PlayerID); err != nil {
-			return fmt.Errorf("flagging %d unranked: %w", o.PlayerID, err)
+			UPDATE accounts
+			SET status = 'unranked',
+			    status_last_checked = to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')
+			WHERE id = $1 AND status = 'active'`, o.AccountID); err != nil {
+			return overflowed, fmt.Errorf("flagging %d unranked: %w", o.AccountID, err)
 		}
-		if err := insertEvent(ctx, tx, o.PlayerID, "player.unranked",
+		if err := insertEvent(ctx, tx, o.AccountID, "account.unranked",
 			map[string]any{"rsn": o.Rsn}); err != nil {
-			return err
+			return overflowed, err
 		}
 
 	case "ok":
-		if _, err := tx.Exec(ctx,
-			`UPDATE forge_players SET last_seen_at = now() WHERE id = $1`, o.PlayerID); err != nil {
-			return fmt.Errorf("touching player %d: %w", o.PlayerID, err)
+		// The overlay is reconciled against fresh hiscores on every successful poll, changed or
+		// not: pruning keys the hiscores have caught up to is how a doubled plugin push stops
+		// sitting above the real value forever.
+		if o.LiveStatsChanged {
+			var live *string
+			if len(o.LiveStats) > 0 {
+				blob, err := json.Marshal(o.LiveStats)
+				if err != nil {
+					return overflowed, fmt.Errorf("marshalling live stats for %d: %w", o.AccountID, err)
+				}
+				str := string(blob)
+				live = &str
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE accounts SET live_stats = $2 WHERE id = $1`, o.AccountID, live); err != nil {
+				return overflowed, fmt.Errorf("reconciling overlay for %d: %w", o.AccountID, err)
+			}
 		}
+
 		if !o.Changed {
-			break // nothing moved: no snapshot, no history row, no event. The common case.
+			break // nothing moved: no snapshot rewrite, no event. The common case.
 		}
 
 		blob, err := json.Marshal(o.Snapshot)
 		if err != nil {
-			return fmt.Errorf("marshalling snapshot for %d: %w", o.PlayerID, err)
+			return overflowed, fmt.Errorf("marshalling snapshot for %d: %w", o.AccountID, err)
 		}
 
+		// Only rewrite the blob when it would differ — an idle account's row stays untouched, which
+		// is most of them, most of the time.
+		// accounts.stats_overall_xp is `integer` (max 2,147,483,647), but a maxed OSRS account
+		// carries ~4.6 BILLION total XP. pgx rejects the value while encoding, the transaction
+		// rolls back, and the claim lease brings the same account back minutes later to fail
+		// identically — a poison pill burning a request forever, for exactly the accounts most
+		// likely to belong to a clan's best players.
+		//
+		// Forge cannot fix it: the column is Anvil.Site's, defined in its drizzle schema, and
+		// widening it here would drift from schema.ts and be reverted by the next generate. So skip
+		// just that column, keep the snapshot (which holds the true figure), and say so loudly.
+		if o.OverallXp > math.MaxInt32 {
+			overflowed = true
+			if _, err := tx.Exec(ctx,
+				`UPDATE accounts SET stats_last_snapshot = $2 WHERE id = $1`,
+				o.AccountID, string(blob)); err != nil {
+				return overflowed, fmt.Errorf("writing snapshot for %d: %w", o.AccountID, err)
+			}
+		} else if _, err := tx.Exec(ctx, `
+			UPDATE accounts
+			SET stats_overall_xp = $2,
+			    stats_last_snapshot = $3
+			WHERE id = $1`, o.AccountID, o.OverallXp, string(blob)); err != nil {
+			return overflowed, fmt.Errorf("writing stats for %d: %w", o.AccountID, err)
+		}
+
+		deltas, err := json.Marshal(o.Deltas)
+		if err != nil {
+			return overflowed, fmt.Errorf("marshalling deltas for %d: %w", o.AccountID, err)
+		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO forge_player_current (player_id, snapshot, overall_xp, captured_at)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (player_id) DO UPDATE
-			SET snapshot = EXCLUDED.snapshot,
-			    overall_xp = EXCLUDED.overall_xp,
-			    captured_at = EXCLUDED.captured_at`,
-			o.PlayerID, blob, o.OverallXp, o.CapturedAt); err != nil {
-			return fmt.Errorf("upserting player_current for %d: %w", o.PlayerID, err)
-		}
-
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO forge_player_snapshots (player_id, captured_at, overall_xp, snapshot)
-			VALUES ($1, $2, $3, $4)`,
-			o.PlayerID, o.CapturedAt, o.OverallXp, blob); err != nil {
-			return fmt.Errorf("inserting snapshot for %d: %w", o.PlayerID, err)
-		}
-
-		if err := insertEvent(ctx, tx, o.PlayerID, "snapshot.changed", map[string]any{
-			"capturedAt": o.CapturedAt,
-			"overallXp":  o.OverallXp,
-			"deltas":     o.Deltas,
-		}); err != nil {
-			return err
+			INSERT INTO forge_player_events (account_id, kind, payload)
+			VALUES ($1, 'snapshot.changed',
+			        jsonb_build_object('capturedAt', $2::text, 'overallXp', $3::bigint,
+			                           'deltas', $4::jsonb, 'snapshot', $5::jsonb))`,
+			o.AccountID, o.CapturedAt.UTC().Format(time.RFC3339), o.OverallXp,
+			string(deltas), string(blob)); err != nil {
+			return overflowed, fmt.Errorf("emitting snapshot event for %d: %w", o.AccountID, err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit for %d: %w", o.PlayerID, err)
+		return overflowed, fmt.Errorf("commit for %d: %w", o.AccountID, err)
 	}
-	return nil
+	return overflowed, nil
 }
 
-func insertEvent(ctx context.Context, tx pgx.Tx, playerID int64, kind string, payload map[string]any) error {
+func insertEvent(ctx context.Context, tx pgx.Tx, accountID int64, kind string, payload map[string]any) error {
 	blob, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshalling %s payload: %w", kind, err)
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO forge_player_events (player_id, kind, payload) VALUES ($1, $2, $3)`,
-		playerID, kind, blob); err != nil {
+		`INSERT INTO forge_player_events (account_id, kind, payload) VALUES ($1, $2, $3)`,
+		accountID, kind, blob); err != nil {
 		return fmt.Errorf("inserting %s event: %w", kind, err)
 	}
 	return nil
@@ -299,20 +366,6 @@ func (s *Store) RecordRun(ctx context.Context, started time.Time, st RunStats) e
 		started, st.Claimed, st.Fetched, st.Changed, st.Unranked, st.Errors, st.Backlog, s.DryRun)
 	if err != nil {
 		return fmt.Errorf("recording run: %w", err)
-	}
-	return nil
-}
-
-// EnsurePartitions creates the snapshot partitions covering the next few months. Called at boot
-// and daily: an insert into a range with no partition is a hard error, so these must exist BEFORE
-// the month they cover, not during it.
-func (s *Store) EnsurePartitions(ctx context.Context) error {
-	for months := 0; months <= 2; months++ {
-		when := time.Now().AddDate(0, months, 0)
-		if _, err := s.pool.Exec(ctx,
-			`SELECT forge_ensure_snapshot_partition($1::date)`, when.Format("2006-01-02")); err != nil {
-			return fmt.Errorf("ensuring partition for %s: %w", when.Format("2006-01"), err)
-		}
 	}
 	return nil
 }

@@ -89,7 +89,7 @@ func (s *Store) PublicPayload(ctx context.Context, scopeKey string) (*Payload, e
 // Caller is an authenticated plugin client.
 type Caller struct {
 	TokenHash []byte
-	PlayerID  *int64
+	AccountID *int64
 	Subject   *string
 }
 
@@ -107,10 +107,10 @@ func (s *Store) Authenticate(ctx context.Context, token string) (*Caller, error)
 
 	c := Caller{TokenHash: hash}
 	err := s.pool.QueryRow(ctx, `
-		SELECT player_id, subject
+		SELECT account_id, subject
 		FROM forge_plugin_credentials
 		WHERE token_hash = $1 AND revoked_at IS NULL`,
-		hash).Scan(&c.PlayerID, &c.Subject)
+		hash).Scan(&c.AccountID, &c.Subject)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -149,10 +149,10 @@ func (s *Store) Ingest(ctx context.Context, c *Caller, kind string, payload json
 	}
 
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO forge_plugin_ingest_events (player_id, subject, kind, payload, dedupe_key)
+		INSERT INTO forge_plugin_ingest_events (account_id, subject, kind, payload, dedupe_key)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,
-		c.PlayerID, c.Subject, kind, payload, key)
+		c.AccountID, c.Subject, kind, payload, key)
 	if err != nil {
 		return false, fmt.Errorf("ingesting %s: %w", kind, err)
 	}

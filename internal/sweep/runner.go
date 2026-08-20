@@ -98,9 +98,18 @@ func (r *Runner) tick(ctx context.Context) error {
 				default:
 					stats.errors.Add(1)
 				}
-				if err := r.Store.Apply(ctx, outcome); err != nil && ctx.Err() == nil {
+				overflowed, err := r.Store.Apply(ctx, outcome)
+				if err != nil && ctx.Err() == nil {
 					r.Log.Error("applying poll result",
-						"playerId", claim.PlayerID, "rsn", claim.Rsn, "error", err)
+						"accountId", claim.AccountID, "rsn", claim.Rsn, "error", err)
+				}
+				if overflowed {
+					// Loud on purpose, and actionable: this is a schema bug in Anvil.Site that
+					// silently mis-tracks its highest-XP players until someone widens the column.
+					r.Log.Error("overall XP does not fit accounts.stats_overall_xp",
+						"accountId", claim.AccountID, "rsn", claim.Rsn,
+						"overallXp", outcome.OverallXp, "columnMax", 2147483647,
+						"fix", "ALTER TABLE accounts ALTER COLUMN stats_overall_xp TYPE bigint")
 				}
 			}
 		}()
@@ -163,7 +172,7 @@ func (r *Runner) poll(ctx context.Context, c store.Claim) store.Outcome {
 	}
 
 	out := store.Outcome{
-		PlayerID:   c.PlayerID,
+		AccountID:  c.AccountID,
 		Rsn:        c.Rsn,
 		Kind:       res.Outcome.String(),
 		CapturedAt: now,
@@ -172,6 +181,12 @@ func (r *Runner) poll(ctx context.Context, c store.Claim) store.Outcome {
 	if res.Outcome == hiscores.OutcomeOK {
 		out.Snapshot = res.Snapshot
 		out.OverallXp = res.Snapshot.OverallXp()
+
+		// Prune the plugin overlay against the fresh read: keys the hiscores caught up to, and keys
+		// stuck above them past the logout window. Done on every successful poll, changed or not —
+		// healing a bogus push is exactly the case where nothing else moved.
+		out.LiveStats, out.LiveStatsChanged = ReconcileOverlay(
+			ParseOverlay(c.LiveStats), ParseKeyTimes(c.LiveStatKeyTimes), res.Snapshot, now)
 		// The change detector: total XP, compared against the value read at claim time. A player
 		// we have never polled counts as changed so their first snapshot always lands — that first
 		// write is the baseline everything else is measured from.
@@ -181,16 +196,16 @@ func (r *Runner) poll(ctx context.Context, c store.Claim) store.Outcome {
 		if out.Changed && c.HasPrevious {
 			// Only now is it worth loading the previous blob. Doing this at claim time instead
 			// would move gigabytes a day to discover that most players did not play.
-			previous, err := r.Store.PreviousSnapshot(ctx, c.PlayerID)
+			previous, err := r.Store.PreviousSnapshot(ctx, c.AccountID)
 			if err != nil {
-				r.Log.Warn("loading previous snapshot", "playerId", c.PlayerID, "error", err)
+				r.Log.Warn("loading previous snapshot", "accountId", c.AccountID, "error", err)
 			} else {
 				out.Deltas = hiscores.ComputeDeltas(previous, res.Snapshot)
 			}
 		}
 	} else if res.Err != nil {
 		r.Log.Debug("hiscores fetch failed",
-			"playerId", c.PlayerID, "rsn", c.Rsn, "outcome", res.Outcome, "error", res.Err)
+			"accountId", c.AccountID, "rsn", c.Rsn, "outcome", res.Outcome, "error", res.Err)
 	}
 
 	d := Next(in)

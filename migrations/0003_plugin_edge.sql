@@ -57,12 +57,13 @@ CREATE TABLE forge_plugin_public_payloads (
 -- Write path
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
 
--- Who may push. The Site owns account linking, verification and auto-claim — all of which are
+-- Who may push. Keyed to accounts(id), the Site's global OSRS account.
+-- The Site owns account linking, verification and auto-claim — all of which are
 -- domain decisions with real subtlety (see resolvePluginMember in Anvil.Site) — and publishes the
 -- resulting answer here as a flat, fast lookup.
 CREATE TABLE forge_plugin_credentials (
   token_hash    bytea PRIMARY KEY,
-  player_id     bigint REFERENCES forge_players(id) ON DELETE CASCADE,
+  account_id    integer REFERENCES accounts(id) ON DELETE CASCADE,
   -- Opaque Site-side identity (its users.id). Forge never interprets it; it is carried through to
   -- the ingest event so the Site can attribute the push without a second lookup.
   subject       text,
@@ -72,7 +73,7 @@ CREATE TABLE forge_plugin_credentials (
   last_seen_at  timestamptz
 );
 
-CREATE INDEX forge_plugin_credentials_player_idx ON forge_plugin_credentials (player_id)
+CREATE INDEX forge_plugin_credentials_account_idx ON forge_plugin_credentials (account_id)
   WHERE revoked_at IS NULL;
 
 -- Raw pushes from the game client. APPEND ONLY.
@@ -86,7 +87,7 @@ CREATE INDEX forge_plugin_credentials_player_idx ON forge_plugin_credentials (pl
 -- consumed_at over a range, re-consume. A push that was evaluated in-request and discarded is gone.
 CREATE TABLE forge_plugin_ingest_events (
   id           bigserial PRIMARY KEY,
-  player_id    bigint REFERENCES forge_players(id) ON DELETE SET NULL,
+  account_id   integer REFERENCES accounts(id) ON DELETE SET NULL,
   subject      text,
   -- 'stats' | 'kill' | 'drop' | 'clog' | 'pb' | 'moment' | 'clip' | 'counter' | 'death' | ...
   -- Deliberately not a CHECK constraint: the plugin ships new event kinds ahead of the server that

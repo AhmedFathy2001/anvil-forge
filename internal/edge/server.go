@@ -239,12 +239,12 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if caller == nil {
 		return
 	}
-	if caller.PlayerID == nil {
+	if caller.AccountID == nil {
 		// A linked token with no resolved player yet. Not an error — the Site links asynchronously.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if err := s.Store.Heartbeat(r.Context(), *caller.PlayerID); err != nil {
+	if err := s.Store.Heartbeat(r.Context(), *caller.AccountID); err != nil {
 		s.Log.Error("recording heartbeat", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "Internal error")
 		return

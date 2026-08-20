@@ -67,12 +67,6 @@ func run(log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	if cfg.EnableSweep {
-		if err := db.EnsurePartitions(ctx); err != nil {
-			return err
-		}
-	}
-
 	mux := http.NewServeMux()
 	registerHealth(mux, db)
 
@@ -141,29 +135,14 @@ func run(log *slog.Logger) error {
 			}
 		}()
 
-		// Derive global player identity from the Site's per-clan memberships.
-		//
-		// Anvil.Site keeps membership per clan, so one account in three clans is three rows with
-		// three independent polling states. Collapsing them is the largest single saving available
-		// on the hiscores budget, and it has to run continuously because rosters change.
+		// Keep sweep_enrolled in step with who is actually in something live. Denormalised because
+		// the claim query runs constantly and must not join the domain schema.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reconcileLoop(ctx, db, cfg.ReconcileInterval, log)
+			enrolmentLoop(ctx, db, cfg.ReconcileInterval, log)
 		}()
 
-		// Keep the snapshot partitions ahead of the calendar. Not tidiness: an insert into an
-		// uncovered range is a hard error, so missing this fails every write at midnight on the
-		// first of the month.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			everyDay(ctx, func() {
-				if err := db.EnsurePartitions(ctx); err != nil {
-					log.Error("ensuring partitions", "error", err)
-				}
-			})
-		}()
 	}
 
 	if cfg.EnableDiscord {
@@ -272,38 +251,34 @@ func reportEdge(ctx context.Context, s *edge.Server, log *slog.Logger) {
 	}
 }
 
-// reconcileLoop keeps forge_players in step with the Site's rosters.
+// enrolmentLoop keeps sweep_enrolled in step with live events and competitions.
 //
-// Runs immediately then on an interval: a Forge that has just started with an empty mapping would
-// otherwise sit idle until the first tick, which at a long interval looks exactly like a broken
-// sweep.
-func reconcileLoop(ctx context.Context, db *store.Store, every time.Duration, log *slog.Logger) {
+// Runs immediately then on an interval: a Forge that has just started would otherwise sit idle
+// until the first tick, which at a five-minute interval looks exactly like a broken sweep.
+func enrolmentLoop(ctx context.Context, db *store.Store, every time.Duration, log *slog.Logger) {
 	run := func() {
-		r, err := db.Reconcile(ctx)
+		r, err := db.RefreshEnrolment(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Error("reconciling players", "error", err)
+				log.Error("refreshing enrolment", "error", err)
 			}
 			return
 		}
-		players, memberships, err := db.Fanout(ctx)
+		accounts, seats, err := db.Fanout(ctx)
 		if err != nil {
 			log.Warn("reading fanout", "error", err)
 		}
-		// dedup is the number that says whether the global identity is earning its complexity —
-		// and the honest denominator for any claim about the polling budget.
+		// The honest denominator for any claim about the polling budget: how many clan seats these
+		// accounts cover, and therefore how many polls the global-account model is NOT making.
 		dedup := 1.0
-		if players > 0 {
-			dedup = float64(memberships) / float64(players)
+		if accounts > 0 {
+			dedup = float64(seats) / float64(accounts)
 		}
-		log.Info("reconcile",
-			"playersUpserted", r.PlayersInserted,
-			"linksUpserted", r.LinksInserted,
-			"linksPruned", r.LinksPruned,
+		log.Info("enrolment",
 			"enrolled", r.Enrolled,
 			"unenrolled", r.Unenrolled,
-			"accounts", players,
-			"memberships", memberships,
+			"accountsTracked", accounts,
+			"clanSeats", seats,
 			"dedup", round2(dedup),
 		)
 	}
@@ -317,19 +292,6 @@ func reconcileLoop(ctx context.Context, db *store.Store, every time.Duration, lo
 			return
 		case <-t.C:
 			run()
-		}
-	}
-}
-
-func everyDay(ctx context.Context, fn func()) {
-	t := time.NewTicker(24 * time.Hour)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			fn()
 		}
 	}
 }
