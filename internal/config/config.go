@@ -16,9 +16,9 @@ type Config struct {
 	// HiscoresRPS is the GLOBAL request rate to Jagex, shared by every worker in the process.
 	//
 	// This is the number that matters most in the entire service, and it is far smaller than
-	// intuition suggests. Wise Old Man — which tracks a large fraction of the whole OSRS
-	// playerbase — runs its production limiter at `{ max: 1, duration: 250 }`, i.e. FOUR requests
-	// per second, globally, with no periodic all-player sweep at all. See docs/RATE_BUDGET.md.
+	// intuition suggests. A large community hiscores tracker — which covers a big fraction of the
+	// whole OSRS playerbase — runs its production limiter at FOUR requests per second, globally,
+	// with no periodic all-player sweep at all. See docs/RATE_BUDGET.md.
 	//
 	// We default marginally above that because we additionally need to detect tile completions
 	// mid-event for players without the plugin. Raising it further is a decision about someone

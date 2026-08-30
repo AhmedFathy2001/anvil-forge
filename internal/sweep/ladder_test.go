@@ -178,13 +178,13 @@ var targetPopulation = map[Tier]int{
 	TierDormant: 400_000, // enrolled but quit — the case that breaks a flat floor
 }
 
-// ForgeBudgetRPS mirrors the FORGE_HISCORES_RPS default. WOM runs the real thing at 4.
+// ForgeBudgetRPS mirrors the FORGE_HISCORES_RPS default. A large community tracker runs the real thing at 4.
 const ForgeBudgetRPS = 5.0
 
 // This is the honest arithmetic, and it is uncomfortable on purpose.
 //
 // The earlier version of this test asserted the ladder "fits" a 150 req/s budget and passed at
-// 87 req/s. That budget was invented. Wise Old Man tracks a large fraction of the entire OSRS
+// 87 req/s. That budget was invented. A large community tracker covers a big fraction of the entire OSRS
 // playerbase at FOUR requests per second with no periodic sweep at all — so the real conclusion is
 // that continuous polling cannot cover this population, and the scheduler's job is allocation
 // under scarcity rather than hitting cadences. See docs/RATE_BUDGET.md.

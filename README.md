@@ -111,7 +111,7 @@ might act on.
 
 ## The thing to understand before changing the scheduler
 
-Wise Old Man tracks a large fraction of the entire OSRS playerbase at **four hiscores requests per
+A large community hiscores tracker covers a big fraction of the entire OSRS playerbase at **four requests per
 second**, globally, with no periodic all-player sweep at all. At 20k clans our enrolled population
 is ~1.2M accounts, which at 5 req/s is **one poll per account every two days**.
 

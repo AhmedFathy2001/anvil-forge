@@ -68,7 +68,7 @@ func (s *Store) Promote(ctx context.Context, accountIDs []int64, reason PromoteR
 
 // PromoteMoved promotes only accounts that have actually gained something recently.
 //
-// Lifted from WOM's `competition-ending-2h` handler, and the single best filter in their design: an
+// The single best filter for a sweep fired as events end: an
 // account that has not moved all event will not have moved in the last two hours either, so
 // re-polling it at the exact moment every competition on the platform is closing spends the
 // scarcest budget of the week on the least likely rows.

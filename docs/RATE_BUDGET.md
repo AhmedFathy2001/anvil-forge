@@ -4,10 +4,10 @@ The single most important number in Forge is how many requests per second it mak
 OSRS hiscores. This document records where that number comes from, because it is the constraint the
 whole scheduler is shaped around and it is much smaller than it first appears.
 
-## What Wise Old Man actually does
+## What a large community tracker actually does
 
-WOM tracks a large fraction of the OSRS playerbase and its server is open source, so its production
-configuration is checkable rather than guessable. From `server/src/jobs/`:
+A large community hiscores tracker covers a big fraction of the OSRS playerbase, and its production
+configuration is publicly documented rather than guessable:
 
 ```ts
 // handlers/update-player.job.ts
@@ -21,7 +21,7 @@ options: {
 That limiter is BullMQ's, backed by Redis, and applies to the whole `UPDATE_PLAYER` queue across
 every worker. So:
 
-**WOM polls the hiscores at 4 requests per second. Globally. In production.**
+**A tracker at that scale polls the hiscores at 4 requests per second. Globally. In production.**
 
 Not 4 per clan, not 4 per worker. Four.
 
@@ -41,7 +41,7 @@ Everything else in their design follows from that being the budget:
 
 ## What that means for us
 
-The arithmetic is unforgiving. At 20k clans we project ~1.2M enrolled accounts. At WOM's 4 req/s:
+The arithmetic is unforgiving. At 20k clans we project ~1.2M enrolled accounts. At that 4 req/s:
 
 ```
 4 req/s x 86,400 s = 345,600 polls/day
@@ -53,7 +53,7 @@ hours. There is no rate, within the realm of politeness, at which 1.2M accounts 
 polled on a competition-relevant cadence.
 
 An earlier version of this design sized the ladder against an ~87 req/s budget and treated that as
-"roughly what WOM-class services do". That was wrong by more than an order of magnitude, and it
+"roughly what services of that class do". That was wrong by more than an order of magnitude, and it
 would have shipped a service that got the box's IP blocked — taking tracking down for every clan at
 once, not just the one that caused it.
 
@@ -71,7 +71,7 @@ budget by priority**. Three consequences:
    budget for the players who do not have it. This reframes plugin adoption from a product
    nice-to-have into the core scaling lever.
 
-3. **Boundaries and demand carry the load, continuous polling fills the gaps.** Following WOM:
+3. **Boundaries and demand carry the load, continuous polling fills the gaps.** Following that model:
    - **event start** — mandatory poll of every participant; this is the frozen baseline, and it is
      the one poll that is never negotiable
    - **event end** — mandatory sweep to close the books exactly
@@ -85,7 +85,7 @@ budget by priority**. Three consequences:
 
 ## The number we ship
 
-`FORGE_HISCORES_RPS` defaults to **5**, marginally above WOM's 4 because we additionally need to
+`FORGE_HISCORES_RPS` defaults to **5**, marginally above that 4 because we additionally need to
 detect tile completions mid-event for players without the plugin.
 
 Raising it is a decision about someone else's infrastructure that we do not pay for and cannot be

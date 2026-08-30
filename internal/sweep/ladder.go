@@ -5,8 +5,8 @@ import "time"
 
 // The backoff ladder: the PRIORITY ORDER in which players are polled.
 //
-// READ docs/RATE_BUDGET.md BEFORE CHANGING ANYTHING HERE. The short version: Wise Old Man tracks a
-// large fraction of the entire OSRS playerbase at FOUR hiscores requests per second, globally, with
+// READ docs/RATE_BUDGET.md BEFORE CHANGING ANYTHING HERE. The short version: a large community
+// hiscores tracker covers a big fraction of the entire OSRS playerbase at FOUR requests per second, globally, with
 // no periodic all-player sweep whatsoever. That is the real-world budget, and it is roughly 20x
 // smaller than a first pass at this problem assumes.
 //
@@ -227,8 +227,8 @@ func errorBackoff(streak int) time.Duration {
 //
 // Without it the promotion path is an amplifier: a refresh button, a burst of plugin heartbeats and
 // a submission arriving together would each pull the same player to the front of the queue, and one
-// enthusiastic user could spend a visible share of a 5 req/s budget on themselves. WOM uses exactly
-// this guard at exactly this value.
+// enthusiastic user could spend a visible share of a 5 req/s budget on themselves. This 60-second
+// minimum-poll guard at this value is the established practice.
 const MinPollInterval = 60 * time.Second
 
 // PromoteNow is the "earned fast tier" side of the ladder: any evidence that a player is alive
