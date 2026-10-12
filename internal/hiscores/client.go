@@ -1,6 +1,7 @@
 package hiscores
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,38 +9,49 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
-// BaseURL is the official OSRS hiscores, main gamemode.
-const BaseURL = "https://secure.runescape.com/m=hiscore_oldschool/"
+// BaseURL is the official OSRS hiscores, main gamemode. The other tables are siblings of it.
+const BaseURL = "https://secure.runescape.com/m=hiscore_oldschool"
 
-// Bosses that are LIVE on the official hiscores but missing from the osrs-json-hiscores release
-// Anvil.Site pins. The lib's parser silently drops activities it does not know, which zeroes
-// BOTW and boss-tile tracking for them — so a new boss is one line here away from being tracked.
-//
-// Mirrors EXTRA_HISCORE_BOSSES in Anvil.Site's src/lib/hiscores.ts. KEEP THE TWO IN SYNC: if only
-// one side knows a boss, the sweep and the Site disagree about whether a tile scored. Prune from
-// both once a lib bump ships it (harmless to leave — the generated table wins when both know it).
-var extraBosses = map[string]string{
-	"Maggot King": "maggotKing",
-	"Mad Angel":   "madAngel",
+// StatsPath is the official JSON endpoint's path, relative to a table's base URL.
+const StatsPath = "/index_lite.json?player="
+
+// Mode names one hiscores table. Values are what Anvil.Site writes into hiscores_fetches.mode.
+type Mode string
+
+const (
+	ModeMain     Mode = "main"
+	ModeIronman  Mode = "ironman"
+	ModeHardcore Mode = "hardcore"
+	ModeUltimate Mode = "ultimate"
+)
+
+// tableSuffix maps a mode onto its table's URL: m=hiscore_oldschool<suffix>/index_lite.json.
+var tableSuffix = map[Mode]string{
+	ModeMain:     "",
+	ModeIronman:  "_ironman",
+	ModeHardcore: "_hardcore_ironman",
+	ModeUltimate: "_ultimate",
 }
 
-// Outcome classifies a fetch so the scheduler can react to a terminal miss differently from a blip.
+// ErrUnknownMode is returned for a mode Forge has no table for. Terminal for that request.
+var ErrUnknownMode = errors.New("unknown hiscores mode")
+
+// Outcome classifies a fetch so the Site can react to a terminal miss differently from a blip.
 type Outcome int
 
 const (
-	// OutcomeOK — a snapshot was read.
+	// OutcomeOK — the endpoint answered with a stats body.
 	OutcomeOK Outcome = iota
-	// OutcomeUnranked — the hiscores 404'd, or the RSN cannot be looked up at all. Terminal:
-	// stop polling and let a re-probe or a human lift the player back.
+	// OutcomeUnranked — the hiscores 404'd, or the RSN cannot be looked up at all. Terminal.
 	OutcomeUnranked
-	// OutcomeTransient — network, timeout, rate limit, or parse failure. Try again later.
+	// OutcomeTransient — network, timeout, rate limit, or a body that is not the endpoint's shape.
 	OutcomeTransient
 )
 
+// String is the value stored in hiscores_fetches.outcome.
 func (o Outcome) String() string {
 	switch o {
 	case OutcomeOK:
@@ -51,10 +63,13 @@ func (o Outcome) String() string {
 	}
 }
 
-// Result is a tagged fetch outcome. Snapshot is non-nil only when Outcome is OutcomeOK.
+// Result is a tagged fetch outcome. Body is set only when Outcome is OutcomeOK.
+//
+// Forge deliberately does not parse the body. Anvil.Site parses it with the same code its in-app
+// fetch uses, so there is no second parser here to fall out of step when a boss is added.
 type Result struct {
-	Outcome  Outcome
-	Snapshot *Snapshot
+	Outcome Outcome
+	Body    []byte
 	// Err carries the underlying cause for logging. Never nil unless Outcome is OutcomeOK.
 	Err error
 }
@@ -82,8 +97,8 @@ func NewClient(userAgent string) *Client {
 		HTTP: &http.Client{
 			Timeout: 8 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        512,
-				MaxIdleConnsPerHost: 256,
+				MaxIdleConns:        64,
+				MaxIdleConnsPerHost: 32,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
@@ -94,30 +109,24 @@ func NewClient(userAgent string) *Client {
 	}
 }
 
-// rawStats is the official endpoint's response shape.
-type rawStats struct {
-	Skills []struct {
-		Name  string `json:"name"`
-		Rank  int64  `json:"rank"`
-		Level int64  `json:"level"`
-		Xp    int64  `json:"xp"`
-	} `json:"skills"`
-	Activities []struct {
-		Name  string `json:"name"`
-		Rank  int64  `json:"rank"`
-		Score int64  `json:"score"`
-	} `json:"activities"`
+// statsShape is the minimum a body must have to be worth handing to the Site.
+type statsShape struct {
+	Skills     []json.RawMessage `json:"skills"`
+	Activities []json.RawMessage `json:"activities"`
 }
 
-// Fetch reads one player's snapshot, retrying once on a transient failure.
+// Fetch reads one player's raw stats body from one table, retrying once on a transient failure.
 //
 // A terminal outcome short-circuits: a 404 or an unlookupable name fails identically on a second
-// attempt, and spending the retry (plus a rate-limit token) to confirm that is how a few thousand
-// renamed accounts turn into a meaningful slice of the polling budget.
-func (c *Client) Fetch(ctx context.Context, rsn string) Result {
+// attempt, and spending the retry to confirm that is how renamed accounts eat the budget.
+func (c *Client) Fetch(ctx context.Context, rsn string, mode Mode) Result {
 	clean := SanitizeRsn(rsn)
 	if !IsPlausibleRsn(clean) {
 		return Result{Outcome: OutcomeUnranked, Err: fmt.Errorf("%w: %q", ErrInvalidRsn, rsn)}
+	}
+	suffix, ok := tableSuffix[mode]
+	if !ok {
+		return Result{Outcome: OutcomeUnranked, Err: fmt.Errorf("%w: %q", ErrUnknownMode, mode)}
 	}
 
 	attempts := c.Retries
@@ -127,9 +136,9 @@ func (c *Client) Fetch(ctx context.Context, rsn string) Result {
 
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		snap, err := c.fetchOnce(ctx, clean)
+		body, err := c.fetchOnce(ctx, clean, suffix)
 		if err == nil {
-			return Result{Outcome: OutcomeOK, Snapshot: snap}
+			return Result{Outcome: OutcomeOK, Body: body}
 		}
 		last = err
 		if errors.Is(err, errNotFound) {
@@ -151,8 +160,8 @@ func (c *Client) Fetch(ctx context.Context, rsn string) Result {
 
 var errNotFound = errors.New("player not found")
 
-func (c *Client) fetchOnce(ctx context.Context, rsn string) (*Snapshot, error) {
-	endpoint := c.BaseURL + StatsPath + url.QueryEscape(rsn)
+func (c *Client) fetchOnce(ctx context.Context, rsn, suffix string) ([]byte, error) {
+	endpoint := c.BaseURL + suffix + StatsPath + url.QueryEscape(rsn)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -166,9 +175,7 @@ func (c *Client) fetchOnce(ctx context.Context, rsn string) (*Snapshot, error) {
 		return nil, err
 	}
 	defer func() {
-		// Drain before closing so the connection returns to the idle pool. At a few hundred
-		// requests a second, leaking sockets instead is the difference between a steady worker
-		// pool and one that runs out of file descriptors overnight.
+		// Drain before closing so the connection returns to the idle pool.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 		_ = resp.Body.Close()
 	}()
@@ -182,76 +189,15 @@ func (c *Client) fetchOnce(ctx context.Context, rsn string) (*Snapshot, error) {
 		return nil, fmt.Errorf("hiscores returned %d for %s", resp.StatusCode, rsn)
 	}
 
-	var raw rawStats
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("decoding hiscores response for %s: %w", rsn, err)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("reading hiscores response for %s: %w", rsn, err)
 	}
-	return parse(&raw), nil
-}
-
-// parse maps the endpoint's by-display-name rows onto our canonical keys, exactly as the Site's
-// parseJsonStats does — matching on a case-folded name because the numeric ids are NOT stable
-// across game updates.
-func parse(raw *rawStats) *Snapshot {
-	skillByName := make(map[string]int, len(raw.Skills))
-	for i, s := range raw.Skills {
-		skillByName[strings.ToLower(s.Name)] = i
+	// Jagex occasionally answers 200 with an HTML error page. Checked here so the Site is never
+	// handed something its parser will choke on, and so the retry gets a second chance at it.
+	var shape statsShape
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&shape); err != nil || len(shape.Skills) == 0 {
+		return nil, fmt.Errorf("hiscores response for %s is not a stats body", rsn)
 	}
-	activityByName := make(map[string]int, len(raw.Activities))
-	for i, a := range raw.Activities {
-		activityByName[strings.ToLower(a.Name)] = i
-	}
-
-	activity := func(displayName string) ScoreEntry {
-		if i, ok := activityByName[strings.ToLower(displayName)]; ok {
-			return ScoreEntry{Rank: raw.Activities[i].Rank, Score: raw.Activities[i].Score}
-		}
-		return Unranked
-	}
-
-	snap := &Snapshot{
-		Skills:       make(map[string]SkillEntry, len(SkillOrder)),
-		Clues:        make(map[string]ScoreEntry, len(ClueOrder)),
-		Bosses:       make(map[string]ScoreEntry, len(BossOrder)),
-		BountyHunter: make(map[string]ScoreEntry, len(BountyHunterOrder)),
-	}
-
-	for _, key := range SkillOrder {
-		if i, ok := skillByName[strings.ToLower(SkillNames[key])]; ok {
-			snap.Skills[key] = SkillEntry{Rank: raw.Skills[i].Rank, Level: raw.Skills[i].Level, Xp: raw.Skills[i].Xp}
-		} else {
-			snap.Skills[key] = UnrankedSkill
-		}
-	}
-	for _, key := range ClueOrder {
-		snap.Clues[key] = activity(ClueNames[key])
-	}
-	for _, key := range BossOrder {
-		snap.Bosses[key] = activity(BossNames[key])
-	}
-
-	// Bosses the pinned lib release does not know yet, merged by name. Never overwrites a key the
-	// generated table already filled, so a lib bump silently takes over without a code change.
-	for displayName, key := range extraBosses {
-		if _, known := snap.Bosses[key]; known {
-			continue
-		}
-		if i, ok := activityByName[strings.ToLower(displayName)]; ok {
-			snap.Bosses[key] = ScoreEntry{Rank: raw.Activities[i].Rank, Score: raw.Activities[i].Score}
-		}
-	}
-
-	for _, key := range BountyHunterOrder {
-		snap.BountyHunter[key] = activity(BountyHunterNames[key])
-	}
-	snap.LeaguePoints = activity(ActivityLeaguePoints)
-	snap.DeadmanPoints = activity(ActivityDeadmanPoints)
-	snap.LastManStanding = activity(ActivityLastManStanding)
-	snap.PvpArena = activity(ActivityPvpArena)
-	snap.SoulWarsZeal = activity(ActivitySoulWarsZeal)
-	snap.RiftsClosed = activity(ActivityRiftsClosed)
-	snap.ColosseumGlory = activity(ActivityColosseumGlory)
-	snap.CollectionsLogged = activity(ActivityCollectionsLogged)
-
-	return snap
+	return body, nil
 }

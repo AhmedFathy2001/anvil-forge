@@ -116,7 +116,7 @@ func run(log *slog.Logger) error {
 
 	if cfg.EnableSweep {
 		runner := &sweep.Runner{
-			Store:    db,
+			Queue:    db,
 			Hiscores: hiscores.NewClient(cfg.UserAgent),
 			Log:      log,
 			// One limiter for the process. Per-worker limits compose into a total nobody chose,
@@ -134,15 +134,6 @@ func run(log *slog.Logger) error {
 				log.Error("sweep stopped", "error", err)
 			}
 		}()
-
-		// Keep sweep_enrolled in step with who is actually in something live. Denormalised because
-		// the claim query runs constantly and must not join the domain schema.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			enrolmentLoop(ctx, db, cfg.ReconcileInterval, log)
-		}()
-
 	}
 
 	if cfg.EnableDiscord {
@@ -247,51 +238,6 @@ func reportEdge(ctx context.Context, s *edge.Server, log *slog.Logger) {
 				"ingested", ingested,
 				"duplicates", duplicates,
 			)
-		}
-	}
-}
-
-// enrolmentLoop keeps sweep_enrolled in step with live events and competitions.
-//
-// Runs immediately then on an interval: a Forge that has just started would otherwise sit idle
-// until the first tick, which at a five-minute interval looks exactly like a broken sweep.
-func enrolmentLoop(ctx context.Context, db *store.Store, every time.Duration, log *slog.Logger) {
-	run := func() {
-		r, err := db.RefreshEnrolment(ctx)
-		if err != nil {
-			if ctx.Err() == nil {
-				log.Error("refreshing enrolment", "error", err)
-			}
-			return
-		}
-		accounts, seats, err := db.Fanout(ctx)
-		if err != nil {
-			log.Warn("reading fanout", "error", err)
-		}
-		// The honest denominator for any claim about the polling budget: how many clan seats these
-		// accounts cover, and therefore how many polls the global-account model is NOT making.
-		dedup := 1.0
-		if accounts > 0 {
-			dedup = float64(seats) / float64(accounts)
-		}
-		log.Info("enrolment",
-			"enrolled", r.Enrolled,
-			"unenrolled", r.Unenrolled,
-			"accountsTracked", accounts,
-			"clanSeats", seats,
-			"dedup", round2(dedup),
-		)
-	}
-
-	run()
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			run()
 		}
 	}
 }

@@ -103,9 +103,9 @@ jobs:
 
   deploy:
     needs: build
-    # A v* tag publishes a pinned image for self-hosters but must not redeploy: the commit it points
-    # at already deployed when its branch was pushed.
-    if: startsWith(github.ref, 'refs/heads/')
+    # BETA ONLY. Production runs no Forge until a deliberate, manual rollout: a push to main (or a v*
+    # tag) builds and publishes the image and stops there, so nothing here touches the prod stack.
+    if: github.ref == 'refs/heads/beta'
     runs-on: ubuntu-latest
     # One-time setup — repo secrets (Settings → Secrets and variables → Actions):
     #   SSH_HOST — the box's IP/hostname
@@ -129,12 +129,15 @@ jobs:
           envs: IMAGE
           script: |
             set -euo pipefail
-            cd /opt/anvil
+            cd /opt/anvil/beta
             # Pin the exact artifact CI just built rather than a moving tag, so "what is running"
-            # always has one answer and a rollback is editing one line.
-            sed -i "s|^FORGE_IMAGE=.*|FORGE_IMAGE=$IMAGE|" forge.env || echo "FORGE_IMAGE=$IMAGE" >> forge.env
-            docker compose pull anvil-forge
-            docker compose up -d anvil-forge
+            # always has one answer and a rollback is editing one line. The beta compose file reads
+            # FORGE_IMAGE from this directory's .env.
+            touch .env
+            sed -i "s|^FORGE_IMAGE=.*|FORGE_IMAGE=$IMAGE|" .env
+            grep -q "^FORGE_IMAGE=" .env || echo "FORGE_IMAGE=$IMAGE" >> .env
+            docker compose pull anvil-forge-beta
+            docker compose up -d anvil-forge-beta
             docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
 
       # The deploy is only real if the new binary is actually serving. /health reports the SHA it
@@ -155,13 +158,13 @@ jobs:
             for i in $(seq 1 20); do
               # Reached over the shared Docker network: Forge publishes no host port, and it should
               # not — only Caddy needs to see it, and only for the plugin edge.
-              body="$(docker run --rm --network anvil_default curlimages/curl:8.11.1 \
-                       -fsS --max-time 5 http://anvil-forge:8080/health 2>/dev/null || true)"
+              body="$(docker run --rm --network container:anvil-forge-beta curlimages/curl:8.11.1 \
+                       -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null || true)"
               if echo "$body" | grep -q "$EXPECTED_SHA"; then
-                echo "anvil-forge healthy on $EXPECTED_SHA"; exit 0
+                echo "anvil-forge-beta healthy on $EXPECTED_SHA"; exit 0
               fi
               echo "waiting for health… ($i/20) got: ${body:-nothing}"; sleep 3
             done
-            echo "::error::anvil-forge did not report sha $EXPECTED_SHA within ~60s"
-            docker logs --tail 50 anvil-forge-1 || true
+            echo "::error::anvil-forge-beta did not report sha $EXPECTED_SHA within ~60s"
+            docker logs --tail 50 anvil-forge-beta || true
             exit 1

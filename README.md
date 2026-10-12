@@ -1,7 +1,7 @@
 # Anvil.Forge
 
-Anvil's data plane. Today it runs the OSRS hiscores sweep; plugin ingest, the Discord fan-out queue
-and the gateway follow.
+Anvil's data plane. Today it fetches the OSRS hiscores for the Site's sweep; plugin ingest, the
+Discord fan-out queue and the gateway follow.
 
 It exists because those four workloads scale with the *playerbase* rather than with how many clans
 signed up, and they want a long-lived process with a worker pool — which is exactly what Next.js
@@ -14,7 +14,7 @@ Anvil.Site, in TypeScript, where it already works.
 
 | Step | State |
 |---|---|
-| 2. Hiscores sweep | **working** — scheduler, ladder, client, persistence, outbox |
+| 2. Hiscores fetching | **working** — drains the Site's `hiscores_fetches` queue under one global rate limit |
 | 3. Plugin read path (`ETag`/304 config + board) | **working** — content-addressed payloads, pre-gzipped, 304 on match |
 | 4. Plugin ingest writes | **working** — token auth, batched pushes, idempotent, heartbeats |
 | 5. Discord fan-out queue | **working** — durable, per-webhook rate limits, 429-aware, dead-webhook detection |
@@ -32,22 +32,19 @@ into an inbox table the Site consumes — the same pattern as `player_events` an
 `plugin_ingest_events`. The *outbound* direction, which is what most features actually need, is
 already covered by the delivery queue in step 5.
 
-### How this fits the Site's schema
+### How the sweep is split (since 2026-10)
 
-The multi-clan rework (`feat/drop-federation`) landed global identity, so Forge no longer has to
-invent any:
+Anvil.Site runs the sweep: who is due, what a read means for tiles, weekly rows, history and
+baselines. With `STATS_SWEEP_OWNER=forge` it stops calling Jagex itself and queues a row per due
+player in `hiscores_fetches` (Site migration `0125`). Forge claims those rows, fetches them under
+**one** global rate limit, and writes back the outcome and the endpoint's **raw JSON body**. The
+Site's next drain parses that body with its own parser and applies it with the same code its
+in-app fetch uses.
 
-- **`players`** is a *person*. **`accounts`** is a global OSRS account — `rsn_normalized` and
-  `account_hash` both UNIQUE, hiscores state on the row, and `accounts_due_idx` already built.
-- **`clan_memberships`** is the seat: `(clan_id, account_id)`. One account in three clans is three
-  seats and **one** poll, which was the whole point.
-
-So Forge's earlier `forge_players` + `Reconcile` — which existed only to derive global identity from
-per-clan membership — are deleted. Keeping a shadow identity table alongside `accounts` would have
-been two sources of truth for "who is this account".
-
-Forge writes `accounts.stats_*` exactly as `/api/cron/stats` does, so every existing read path keeps
-working and rollback is turning Forge off.
+So Forge holds no copy of the sweep's rules and no parser to keep in step. An earlier design had
+Forge run its own scheduler and write `accounts.stats_*` directly; it drifted from the Site within
+weeks and was retired. Forge only fetches what it was asked for, so it cannot add hiscores traffic
+the Site did not choose.
 
 ## Running it locally
 
@@ -80,13 +77,13 @@ go test ./internal/sweep -v         # prints the budget arithmetic
 | Variable | Default | Notes |
 |---|---|---|
 | `DATABASE_URL` | — | required |
-| `FORGE_HISCORES_RPS` | `5` | **global** rate to Jagex. Read [docs/RATE_BUDGET.md](docs/RATE_BUDGET.md) before raising. |
-| `FORGE_HISCORES_BURST` | `10` | |
-| `FORGE_WORKERS` | `8` | in-flight fetches; the limiter governs regardless |
-| `FORGE_CLAIM_BATCH` | `200` | players leased per claim |
-| `FORGE_CLAIM_LEASE` | `5m` | a crashed worker costs its players this much delay |
-| `FORGE_TICK_INTERVAL` | `10s` | how often to look for due players — *not* the polling cadence |
-| `FORGE_DRY_RUN` | `false` | |
+| `FORGE_HISCORES_RPS` | `1` | **global** rate to Jagex. Read [docs/RATE_BUDGET.md](docs/RATE_BUDGET.md) before raising. |
+| `FORGE_HISCORES_BURST` | `2` | |
+| `FORGE_WORKERS` | `4` | in-flight fetches; the limiter governs regardless |
+| `FORGE_CLAIM_BATCH` | `20` | queue rows leased per claim |
+| `FORGE_CLAIM_LEASE` | `5m` | a crashed worker's rows return to the queue after this |
+| `FORGE_TICK_INTERVAL` | `5s` | how often an idle runner re-checks the queue |
+| `FORGE_DRY_RUN` | `false` | fetches for real but writes no result back — not free |
 | `FORGE_HTTP_ADDR` | `:8080` | `/health` (liveness), `/ready` (DB + backlog), plugin edge |
 | `FORGE_LOG_LEVEL` | `info` | |
 | `FORGE_ENABLE_SWEEP` / `_EDGE` / `_DISCORD` | `true` | run subsystems independently |
@@ -99,7 +96,7 @@ go test ./internal/sweep -v         # prints the budget arithmetic
 | Route | Notes |
 |---|---|
 | `GET /health` | liveness; never touches the database |
-| `GET /ready` | readiness; pings Postgres and reports sweep backlog |
+| `GET /ready` | readiness; pings Postgres and reports the fetch-queue backlog |
 | `GET /api/plugin/config` | bearer auth, `ETag`/304, pre-gzipped |
 | `GET /api/plugin/board` | same, plus anonymous `?eventId=` preview |
 | `POST /api/plugin/ingest` | single or batched pushes, idempotent via `dedupeKey`, returns **202** |
@@ -109,36 +106,27 @@ go test ./internal/sweep -v         # prints the budget arithmetic
 *scored* yet. The Site decides what any of it means, so promising more would be a lie the plugin
 might act on.
 
-## The thing to understand before changing the scheduler
+## The thing to understand before changing the rate
 
-A large community hiscores tracker covers a big fraction of the entire OSRS playerbase at **four requests per
-second**, globally, with no periodic all-player sweep at all. At 20k clans our enrolled population
-is ~1.2M accounts, which at 5 req/s is **one poll per account every two days**.
+A large community hiscores tracker covers a big fraction of the entire OSRS playerbase at **four
+requests per second**, globally, with no periodic all-player sweep at all. Polling is not a way to
+keep everyone fresh; it is a scarce budget allocated by priority, and the Site does the allocating
+(plugin-first scheduling, the backoff ladder, competition work ahead of roster filler — queue
+`priority` 0/1/2). The plugin carries the load: a push costs zero hiscores requests.
 
-So the sweep is not a way to keep everyone fresh — it cannot be, at any polite request rate. It is
-a way to **allocate a scarce budget by priority**. What actually carries the load:
-
-1. **The plugin** — push costs zero hiscores requests. Every point of adoption buys budget for
-   players who do not have it. This is the core scaling lever, not a product nice-to-have.
-2. **Boundaries** — a mandatory poll at event start (the frozen baseline) and at event end (closing
-   the books exactly). Twice per event, so affordable.
-3. **On demand** — a refresh button with a 60s per-player floor.
-4. **The ladder** — spends whatever remains on whoever is most likely to have moved.
-
-Backlog in `sweep_runs` is the expected steady state, not a fault. Because baselines are frozen at
-enrolment and gains are `current − baseline`, slow polling costs *detection latency*, never
-*correctness* — which is the property that makes allocating under scarcity acceptable at all.
+A growing `backlog` on `/ready` means the Site is asking for more than the rate can fetch. Widen the
+Site's ladder before raising `FORGE_HISCORES_RPS`.
 
 ## Layout
 
 ```
 cmd/forge/            entrypoint, health server
-internal/hiscores/    client, parser, RSN rules, generated name tables
-internal/sweep/       the ladder (pure, tested) and the runner
-internal/store/       pgx queries; boundary.go is the Site-facing surface
+internal/hiscores/    client (raw body per hiscores table), RSN rules
+internal/sweep/       the queue runner
+internal/store/       pgx queries: claim, complete, run log
 internal/config/      environment
 migrations/           Forge-owned tables only
-scripts/              name-table generator, dev seed
+scripts/              dev seed
 ```
 
 ## Licence
@@ -147,17 +135,14 @@ Same as the rest of Anvil: PolyForm Noncommercial + Attribution. Source-availabl
 
 ## Deploying
 
-CI mirrors Anvil.Admin's shape, not the Site's: Forge is a **singleton**, so there is no per-clan
-rollout. Build → GHCR → SSH → `docker compose up -d anvil-forge` → health gate.
+**Beta only.** A push to the `beta` branch builds the image and deploys it into the beta stack
+(`/opt/anvil/beta`, service `anvil-forge-beta`, image pinned via `FORGE_IMAGE` in that directory's
+`.env`). A push to `main` or a `v*` tag builds and publishes the image and stops: production runs no
+Forge until a deliberate, manual rollout.
 
 The health gate checks that `/health` reports the SHA CI just built, not merely that something
 answered — the question after a deploy is "is the new one running", and a green check on the old
 binary is worse than a red one.
-
-```
-deploy/compose-snippet.yml   # add to /opt/anvil/docker-compose.yml
-deploy/forge.env.example     # copy to /opt/anvil/forge.env
-```
 
 Repo secrets needed: `SSH_HOST`, `SSH_USER`, `SSH_KEY`, optionally `SSH_PORT`. Until `SSH_HOST` is
 set the deploy step is skipped and the build still publishes the image.

@@ -1,143 +1,94 @@
 package hiscores
 
 import (
-	"encoding/json"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
-	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
-// The differential test that matters: parse a REAL hiscores response and require the result to
-// equal, field for field, what Anvil.Site's osrs-json-hiscores parser produces for the same bytes.
-//
-// This is the one place a port can be wrong without anything failing loudly — a boss key that
-// doesn't match just scores zero forever. Regenerate the golden after bumping the lib:
-//
-//	node scripts/gen-hiscores-names.mjs
-//	node scripts/gen-golden.mjs
-func TestParseMatchesSiteParser(t *testing.T) {
-	rawBytes, err := os.ReadFile("testdata/lynx_titan.json")
-	if err != nil {
-		t.Fatalf("reading fixture: %v", err)
-	}
-	goldenBytes, err := os.ReadFile("testdata/lynx_titan.golden.json")
-	if err != nil {
-		t.Fatalf("reading golden: %v", err)
-	}
+// A fake hiscores server: answers per table path, so the tests pin which URL each mode reads.
+func fakeServer(t *testing.T, handler func(path, player string) (int, string)) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		code, body := handler(r.URL.Path, r.URL.Query().Get("player"))
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient("test")
+	c.BaseURL = srv.URL + "/m=hiscore_oldschool"
+	c.RetryDelay = time.Millisecond
+	return c
+}
 
-	var raw rawStats
-	if err := json.Unmarshal(rawBytes, &raw); err != nil {
-		t.Fatalf("decoding fixture: %v", err)
-	}
-	got := parse(&raw)
-
-	// Compare as generic JSON so field order and Go/JS numeric representation don't matter —
-	// only the values do.
-	gotJSON, err := json.Marshal(got)
+func TestFetchReturnsTheRawBodyFromEachTable(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/lynx_titan.json")
 	if err != nil {
-		t.Fatalf("marshalling parsed: %v", err)
+		t.Fatal(err)
 	}
-	var gotAny, wantAny any
-	if err := json.Unmarshal(gotJSON, &gotAny); err != nil {
-		t.Fatalf("re-decoding parsed: %v", err)
-	}
-	if err := json.Unmarshal(goldenBytes, &wantAny); err != nil {
-		t.Fatalf("decoding golden: %v", err)
-	}
-
-	if !reflect.DeepEqual(gotAny, wantAny) {
-		for _, diff := range diffJSON("", wantAny, gotAny) {
-			t.Errorf("%s", diff)
+	var paths []string
+	c := fakeServer(t, func(path, player string) (int, string) {
+		paths = append(paths, path)
+		if player != "Lynx Titan" {
+			t.Errorf("player = %q", player)
 		}
+		return 200, string(fixture)
+	})
+
+	for _, mode := range []Mode{ModeMain, ModeIronman, ModeHardcore, ModeUltimate} {
+		res := c.Fetch(context.Background(), "Lynx Titan", mode)
+		if res.Outcome != OutcomeOK {
+			t.Fatalf("%s: outcome %s (%v)", mode, res.Outcome, res.Err)
+		}
+		if string(res.Body) != string(fixture) {
+			t.Fatalf("%s: body was altered", mode)
+		}
+	}
+	want := []string{
+		"/m=hiscore_oldschool/index_lite.json",
+		"/m=hiscore_oldschool_ironman/index_lite.json",
+		"/m=hiscore_oldschool_hardcore_ironman/index_lite.json",
+		"/m=hiscore_oldschool_ultimate/index_lite.json",
+	}
+	if strings.Join(paths, ",") != strings.Join(want, ",") {
+		t.Fatalf("paths = %v", paths)
 	}
 }
 
-func TestParseRealValues(t *testing.T) {
-	rawBytes, err := os.ReadFile("testdata/lynx_titan.json")
-	if err != nil {
-		t.Fatalf("reading fixture: %v", err)
-	}
-	var raw rawStats
-	if err := json.Unmarshal(rawBytes, &raw); err != nil {
-		t.Fatalf("decoding fixture: %v", err)
-	}
-	snap := parse(&raw)
-
-	// 4.6 billion overall XP is the whole reason XP is int64 — it overflows int32 by 2x. If this
-	// ever reads back as a negative or truncated number, the change detector inverts and every
-	// maxed account looks like it is losing XP every tick.
-	if got := snap.OverallXp(); got != 4_600_000_000 {
-		t.Errorf("OverallXp() = %d, want 4600000000", got)
-	}
-	if e := snap.Skills["attack"]; e.Level != 99 || e.Xp != 200_000_000 {
-		t.Errorf("attack = %+v, want level 99 xp 200000000", e)
-	}
-	// The extra-boss merge: both of these post-date the pinned lib release, so they only appear
-	// if extraBosses did its job.
-	for _, key := range []string{"maggotKing", "madAngel"} {
-		if _, ok := snap.Bosses[key]; !ok {
-			t.Errorf("boss %q missing — extraBosses merge did not run", key)
+func TestFetchClassifiesFailures(t *testing.T) {
+	calls := 0
+	c := fakeServer(t, func(_, player string) (int, string) {
+		calls++
+		switch player {
+		case "Gone":
+			return 404, ""
+		case "Html":
+			return 200, "<html>busy</html>"
+		default:
+			return 503, ""
 		}
-	}
-	if len(snap.BountyHunter) != 4 {
-		t.Errorf("bountyHunter has %d modes, want 4 (current + legacy)", len(snap.BountyHunter))
-	}
-}
+	})
 
-// An unranked player is the common case for a fresh account, and the -1 sentinel is what stops a
-// first kill from scoring as though it were the hundredth.
-func TestParseUnrankedIsMinusOne(t *testing.T) {
-	var raw rawStats // no skills, no activities
-	snap := parse(&raw)
-
-	if e := snap.Skills["attack"]; e != UnrankedSkill {
-		t.Errorf("missing skill = %+v, want %+v", e, UnrankedSkill)
+	if r := c.Fetch(context.Background(), "Gone", ModeMain); r.Outcome != OutcomeUnranked {
+		t.Fatalf("404: %s", r.Outcome)
 	}
-	if e := snap.Bosses["zulrah"]; e != Unranked {
-		t.Errorf("missing boss = %+v, want %+v", e, Unranked)
+	if calls != 1 {
+		t.Fatalf("a 404 must not be retried; calls = %d", calls)
 	}
-	// ...but the clamped accessors present it as zero, so arithmetic never sees the sentinel.
-	if xp := snap.OverallXp(); xp != 0 {
-		t.Errorf("OverallXp() on unranked = %d, want 0", xp)
+	if r := c.Fetch(context.Background(), "Html", ModeMain); r.Outcome != OutcomeTransient {
+		t.Fatalf("html body: %s", r.Outcome)
 	}
-	if kc, ranked := snap.BossKc("zulrah"); kc != 0 || ranked {
-		t.Errorf("BossKc(zulrah) = (%d, %v), want (0, false)", kc, ranked)
+	if r := c.Fetch(context.Background(), "Down", ModeMain); r.Outcome != OutcomeTransient {
+		t.Fatalf("503: %s", r.Outcome)
 	}
-}
-
-// diffJSON walks two decoded JSON values and reports the leaf paths that differ, so a failure
-// names the boss key rather than dumping two 6 KB blobs.
-func diffJSON(path string, want, got any) []string {
-	if reflect.DeepEqual(want, got) {
-		return nil
+	if r := c.Fetch(context.Background(), "Down", Mode("seasonal")); r.Outcome != OutcomeUnranked {
+		t.Fatalf("unknown mode: %s", r.Outcome)
 	}
-	wantMap, wOK := want.(map[string]any)
-	gotMap, gOK := got.(map[string]any)
-	if !wOK || !gOK {
-		return []string{path + ": want " + render(want) + ", got " + render(got)}
+	if r := c.Fetch(context.Background(), "this name is far too long", ModeMain); r.Outcome != OutcomeUnranked {
+		t.Fatalf("invalid rsn: %s", r.Outcome)
 	}
-
-	var out []string
-	for key, wantVal := range wantMap {
-		gotVal, present := gotMap[key]
-		if !present {
-			out = append(out, path+"."+key+": missing (want "+render(wantVal)+")")
-			continue
-		}
-		out = append(out, diffJSON(path+"."+key, wantVal, gotVal)...)
-	}
-	for key, gotVal := range gotMap {
-		if _, present := wantMap[key]; !present {
-			out = append(out, path+"."+key+": unexpected (got "+render(gotVal)+")")
-		}
-	}
-	return out
-}
-
-func render(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "<unrenderable>"
-	}
-	return string(b)
 }

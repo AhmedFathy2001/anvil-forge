@@ -20,11 +20,10 @@ type Config struct {
 	// whole OSRS playerbase — runs its production limiter at FOUR requests per second, globally,
 	// with no periodic all-player sweep at all. See docs/RATE_BUDGET.md.
 	//
-	// We default marginally above that because we additionally need to detect tile completions
-	// mid-event for players without the plugin. Raising it further is a decision about someone
-	// else's infrastructure that we do not pay for and cannot be granted more of by asking;
-	// exceeding what they tolerate blocks the box's IP, which takes tracking down for every clan
-	// at once. Exhaust plugin adoption, a wider ladder, and boundary/on-demand polling first.
+	// Defaults to 1: about what Anvil.Site's in-app sweep averaged, and a quarter of that tracker.
+	// The plugin pushes stats for everyone running it, so the hiscores only reconcile. Raising it
+	// is a decision about someone else's infrastructure that we do not pay for; exceeding what they
+	// tolerate blocks the box's IP, which takes tracking down for every clan at once.
 	HiscoresRPS float64
 
 	// HiscoresBurst lets short bursts through while holding the long-run average at HiscoresRPS.
@@ -41,12 +40,8 @@ type Config struct {
 	// worker costs its players this much delay and nothing else.
 	ClaimLease time.Duration
 
-	// ReconcileInterval is how often global player identity is re-derived from the Site's rosters.
-	// Minutes, not seconds: rosters change on human timescales, and the queries scan clan_members.
-	ReconcileInterval time.Duration
-
-	// TickInterval is how often the runner looks for due players. Not the polling cadence — that
-	// is per player, from the ladder.
+	// TickInterval is how often an idle runner re-checks the queue. Not a polling cadence — who is
+	// due is the Site's decision.
 	TickInterval time.Duration
 
 	// UserAgent identifies us to Jagex. Being identifiable is cheap insurance: an operator who can
@@ -82,17 +77,16 @@ type Config struct {
 // Load reads configuration from the environment, applying defaults sized for a single box.
 func Load() (*Config, error) {
 	c := &Config{
-		DatabaseURL:       os.Getenv("DATABASE_URL"),
-		HiscoresRPS:       envFloat("FORGE_HISCORES_RPS", 5),
-		HiscoresBurst:     envInt("FORGE_HISCORES_BURST", 10),
-		Workers:           envInt("FORGE_WORKERS", 8),
-		ClaimBatch:        envInt("FORGE_CLAIM_BATCH", 200),
-		ClaimLease:        envDuration("FORGE_CLAIM_LEASE", 5*time.Minute),
-		TickInterval:      envDuration("FORGE_TICK_INTERVAL", 10*time.Second),
-		ReconcileInterval: envDuration("FORGE_RECONCILE_INTERVAL", 5*time.Minute),
-		UserAgent:         envStr("FORGE_USER_AGENT", "Anvil.Forge/1.0 (+https://anvilosrs.com; contact@anvilosrs.com)"),
-		DryRun:            envBool("FORGE_DRY_RUN", false),
-		HTTPAddr:          envStr("FORGE_HTTP_ADDR", ":8080"),
+		DatabaseURL:   os.Getenv("DATABASE_URL"),
+		HiscoresRPS:   envFloat("FORGE_HISCORES_RPS", 1),
+		HiscoresBurst: envInt("FORGE_HISCORES_BURST", 2),
+		Workers:       envInt("FORGE_WORKERS", 4),
+		ClaimBatch:    envInt("FORGE_CLAIM_BATCH", 20),
+		ClaimLease:    envDuration("FORGE_CLAIM_LEASE", 5*time.Minute),
+		TickInterval:  envDuration("FORGE_TICK_INTERVAL", 5*time.Second),
+		UserAgent:     envStr("FORGE_USER_AGENT", "Anvil.Forge/1.0 (+https://anvilosrs.com; contact@anvilosrs.com)"),
+		DryRun:        envBool("FORGE_DRY_RUN", false),
+		HTTPAddr:      envStr("FORGE_HTTP_ADDR", ":8080"),
 
 		EnableSweep:   envBool("FORGE_ENABLE_SWEEP", true),
 		EnableEdge:    envBool("FORGE_ENABLE_EDGE", true),

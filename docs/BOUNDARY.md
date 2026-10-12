@@ -6,13 +6,13 @@ Forge **ingests**. The Site **evaluates**. Nothing crosses that line.
 
 Forge may:
 
-- decide *when* to poll a player
-- fetch the hiscores and store the result
-- detect that something *changed*
+- fetch the hiscores the Site queued, under one global rate limit, and store the raw result
 - record a plugin heartbeat
 
 Forge may **not**:
 
+- decide *who* to poll or *when* — the Site's sweep queues that
+- parse or interpret a hiscores body
 - decide whether a change completes a tile
 - decide whether a milestone was crossed
 - decide what a weekly standing is
@@ -39,45 +39,20 @@ growing a concept of "tiles", the boundary has moved and something has gone wron
 
 ## How they talk
 
-### Forge → Site: the `forge_player_events` outbox
+### Site ⇄ Forge: the `hiscores_fetches` queue
 
-Forge appends; the Site consumes and marks consumed.
+The Site's sweep (`lib/statsSweep`, source `forge`) builds its due list and inserts one row per due
+player; a partial unique index on `(rsn_key, mode) WHERE fetched_at IS NULL` makes re-queueing free.
+Forge claims pending rows (`priority`, then `requested_at`; `FOR UPDATE SKIP LOCKED`, leased via
+`claimed_at`), fetches, and writes `fetched_at`, `outcome` (`ok`/`unranked`/`transient`) and the raw
+`body`. The Site's next drain marks rows consumed, parses each body with `lib/hiscores`, and applies
+it through the exact code its in-app fetch uses. A read older than 30 minutes is dropped rather than
+applied.
 
-```sql
-SELECT id, account_id, kind, payload
-FROM forge_player_events
-WHERE consumed_at IS NULL
-ORDER BY id
-LIMIT 500;
--- ... evaluate ...
-UPDATE forge_player_events SET consumed_at = now() WHERE id = ANY($1);
-```
+`mode` picks the table — `main`, `ironman`, `hardcore`, `ultimate` — so the account-type check is the
+same queue with a different mode.
 
-| kind | payload | what the Site does with it |
-|---|---|---|
-| `snapshot.changed` | `{capturedAt, overallXp, deltas, snapshot}` | score stat tiles, roll up daily history, detect milestones, apply weekly values |
-| `account.unranked` | `{rsn}` | flag for re-probe / rename review |
-| `rsn.changed` | `{from, to}` | update display names, append rename history |
-
-A durable outbox rather than `LISTEN/NOTIFY` on purpose: scoring bugs are replayable. Fix the rule,
-reset `consumed_at` over a range, re-consume. With a fire-and-forget channel the evidence is gone.
-
-### Site → Forge: writes to `accounts`
-
-The Site never calls a Forge API — a scheduler that needs an HTTP round trip to learn someone
-enrolled is a scheduler with an outage mode. Everything goes through shared columns.
-
-| When | What | Store method |
-|---|---|---|
-| event start / end | promote every participant | `Promote` |
-| event ending soon | promote only participants who have moved | `PromoteMoved` |
-| plugin push | stamp `sweep_live_seen_at` | `RecordHeartbeat` |
-
-Enrolment is the exception: Forge refreshes `sweep_enrolled` itself on a timer from live events and
-competitions, so the Site does not have to remember to. It is denormalised because the claim query
-runs constantly and must stay a single-table index scan — walking
-`event_participants → clan_memberships → accounts` on every claim would put the domain schema on the
-hot path.
+The earlier `forge_player_events` outbox (Forge scheduling and scoring-adjacent writes) is retired.
 
 ### Site → Forge: the plugin read path
 
@@ -140,51 +115,21 @@ never reserialise one.
 There is no second datastore. Forge is a second **process** against the same Postgres, and
 "ownership" means only "this is what writes here".
 
-That is why Forge adds so little schema. It is replacing the **cron**, not the **schema**: XP and
-kill counts are Anvil data that Forge happens to fetch, so they go in the columns the Site already
-reads.
+For the sweep Forge writes exactly one Site table, and only the result columns of rows it claimed:
 
 | | |
 |---|---|
-| **Forge writes, Site owns** | `accounts.stats_next_due_at`, `stats_miss_streak`, `stats_overall_xp`, `stats_last_snapshot`, `status`, `live_stats` |
-| **Forge adds to `accounts`** | `sweep_tier`, `sweep_error_streak`, `sweep_claimed_at`, `sweep_live_seen_at`, `sweep_enrolled` — the little the TS cron never had to persist because it recomputed each tick |
-| **Forge-only tables** | `forge_player_events` (outbox), `forge_sweep_runs`, `forge_discord_deliveries`, `forge_plugin_payloads` / `_bindings` / `_public_payloads` / `_credentials` / `_ingest_events` |
-| **Site owns outright** | `players` (people), `accounts`, `clan_memberships`, `clans`, events, tiles, teams, completions, `player_snapshots`, everything else |
-
-Scheduling state lives as columns on `accounts` rather than in a parallel table. A `forge_sweep_state`
-table was the obvious move and the wrong one: two rows per account, a join on the hottest query in
-the service, and two places to look when someone is not being polled. These columns belong next to
-`stats_next_due_at`, which is the column they modify.
-
-The Site reads Forge's tables freely. It just does not **write** them, with the exceptions above.
-
-**One known schema bug, and it is the Site's to fix.** `accounts.stats_overall_xp` is `integer`
-(max 2,147,483,647), but a maxed OSRS account carries ~4.6 **billion** total XP. The write is
-rejected client-side, and with a claim lease that account comes back minutes later to fail
-identically — a poison pill burning requests forever, on precisely the accounts belonging to a
-clan's best players. Forge degrades gracefully (keeps the snapshot, which holds the true figure,
-and logs loudly), but the fix belongs in `schema.ts`:
-
-```ts
-statsOverallXp: bigint('stats_overall_xp', { mode: 'number' }),
-```
-
-Forge deliberately does not `ALTER` it: the column is drizzle-owned, and widening it here would
-drift from `schema.ts` and be reverted by the next `drizzle-kit generate`.
+| **Forge writes (Site-owned, migration 0125)** | `hiscores_fetches.claimed_at`, `fetched_at`, `outcome`, `body`, `error`; `forge_sweep_runs` (its tick log) |
+| **Forge-only tables** | `forge_discord_deliveries`, `forge_plugin_payloads` / `_bindings` / `_public_payloads` / `_credentials` / `_ingest_events` |
+| **Retired** | `forge_player_events` and the `accounts.sweep_*` columns, from the design where Forge ran its own scheduler |
+| **Site owns outright** | `players`, `accounts` (all stats columns), `clan_memberships`, `clans`, events, tiles, teams, completions, everything else |
 
 Migrations for Forge-owned tables ship in this repo. Migrations for everything else ship in
 Anvil.Site. Neither repo's migration tool should ever see the other's tables.
 
-## The one shared contract that can silently break
+## No shared parser
 
-`internal/hiscores/names_gen.go` maps hiscores display names to canonical keys, and it is generated
-from the same `osrs-json-hiscores` release the Site pins. A tile tracking `zulrah` scores off a key
-this table produces.
-
-If the two drift, **nothing errors** — the tile just quietly scores zero forever. So:
-
-- after bumping `osrs-json-hiscores` in Anvil.Site, run `node scripts/gen-hiscores-names.mjs` here
-- `extraBosses` in `internal/hiscores/client.go` must mirror `EXTRA_HISCORE_BOSSES` in the Site's
-  `src/lib/hiscores.ts`
-- `TestParseMatchesSiteParser` diffs a real hiscores response against the TS parser's output; it is
-  the thing that catches this, and it is why the golden file is committed
+Forge used to parse hiscores into snapshots with a Go port of `osrs-json-hiscores`, and a boss
+missing from its generated name table silently scored zero. It now stores the endpoint's body
+verbatim and the Site parses it, so a new boss is one line in the Site's `EXTRA_HISCORE_BOSSES` and
+nothing here.
