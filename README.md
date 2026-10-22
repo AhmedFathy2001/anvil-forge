@@ -112,7 +112,8 @@ A large community hiscores tracker covers a big fraction of the entire OSRS play
 requests per second**, globally, with no periodic all-player sweep at all. Polling is not a way to
 keep everyone fresh; it is a scarce budget allocated by priority, and the Site does the allocating
 (plugin-first scheduling, the backoff ladder, competition work ahead of roster filler — queue
-`priority` 0/1/2). The plugin carries the load: a push costs zero hiscores requests.
+`priority` -1/0/1/2, where -1 is a late joiner waiting on their start line and takes at most a fifth
+of each claim). The plugin carries the load: a push costs zero hiscores requests.
 
 A growing `backlog` on `/ready` means the Site is asking for more than the rate can fetch. Widen the
 Site's ladder before raising `FORGE_HISCORES_RPS`.

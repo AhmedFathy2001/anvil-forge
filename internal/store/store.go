@@ -59,23 +59,65 @@ type Request struct {
 	Mode string
 }
 
+// Queue lanes (hiscores_fetches.priority; the Site decides which lane a request goes in):
+//
+//	-1  late joiner — one player just added to a running competition, waiting on their start line
+//	 0  a competition is waiting
+//	 1  roster filler
+//	 2  background account-type probes
+//
+// Lower goes first. The late-joiner lane (any priority below zero) jumps everything, but only up to
+// JumpShare(limit) rows per claim: a burst of late adds can slow the competition lane, never stop it.
+// An older Forge that knows nothing of the lane orders it first anyway (ORDER BY priority), just
+// without the bound — the Site keeps that burst small on its side too.
+
+// JumpShare is how many late-joiner rows one claim of `limit` may take: a fifth, at least one.
+func JumpShare(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	n := limit / 5
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // Claim leases up to `limit` pending requests, highest priority (lowest number) and oldest first,
-// skipping rows another worker holds. A row whose lease lapsed — its worker crashed mid-fetch — is
-// pending again, so nothing is lost and nothing needs a reaper.
+// skipping rows another worker holds — late joiners first, capped at JumpShare(limit), then the rest.
+// A row whose lease lapsed — its worker crashed mid-fetch — is pending again, so nothing is lost and
+// nothing needs a reaper.
 func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Request, error) {
 	rows, err := s.pool.Query(ctx, `
-		UPDATE hiscores_fetches f
-		SET claimed_at = now()
-		FROM (
-		  SELECT id FROM hiscores_fetches
+		WITH jump AS (
+		  SELECT id, priority, requested_at FROM hiscores_fetches
 		  WHERE fetched_at IS NULL
 		    AND (claimed_at IS NULL OR claimed_at < now() - $2::interval)
+		    AND priority < 0
+		  ORDER BY priority, requested_at
+		  LIMIT $3
+		  FOR UPDATE SKIP LOCKED
+		), rest AS (
+		  SELECT id, priority, requested_at FROM hiscores_fetches
+		  WHERE fetched_at IS NULL
+		    AND (claimed_at IS NULL OR claimed_at < now() - $2::interval)
+		    AND priority >= 0
 		  ORDER BY priority, requested_at
 		  LIMIT $1
 		  FOR UPDATE SKIP LOCKED
-		) due
-		WHERE f.id = due.id
-		RETURNING f.id, f.rsn, f.mode`, limit, lease.String())
+		), due AS (
+		  SELECT id FROM (SELECT * FROM jump UNION ALL SELECT * FROM rest) picked
+		  ORDER BY priority, requested_at
+		  LIMIT $1
+		), claimed AS (
+		  UPDATE hiscores_fetches f
+		  SET claimed_at = now()
+		  FROM due
+		  WHERE f.id = due.id
+		  RETURNING f.id, f.rsn, f.mode, f.priority, f.requested_at
+		)
+		-- Handed to the workers in lane order, so a late joiner is fetched first within the batch too.
+		SELECT id, rsn, mode FROM claimed ORDER BY priority, requested_at`, limit, lease.String(), JumpShare(limit))
 	if err != nil {
 		return nil, fmt.Errorf("claiming fetches: %w", err)
 	}

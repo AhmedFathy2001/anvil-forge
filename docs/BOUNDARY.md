@@ -44,7 +44,8 @@ growing a concept of "tiles", the boundary has moved and something has gone wron
 The Site's sweep (`lib/statsSweep`, source `forge`) builds its due list and inserts one row per due
 player; a partial unique index on `(rsn_key, mode) WHERE fetched_at IS NULL` makes re-queueing free.
 Forge claims pending rows (`priority`, then `requested_at`; `FOR UPDATE SKIP LOCKED`, leased via
-`claimed_at`), fetches, and writes `fetched_at`, `outcome` (`ok`/`unranked`/`transient`) and the raw
+`claimed_at`; lanes -1 late joiner / 0 competition / 1 filler / 2 probes, the late-joiner lane capped at
+a fifth of each claim — `store.JumpShare`), fetches, and writes `fetched_at`, `outcome` (`ok`/`unranked`/`transient`) and the raw
 `body`. The Site's next drain marks rows consumed, parses each body with `lib/hiscores`, and applies
 it through the exact code its in-app fetch uses. A read older than 30 minutes is dropped rather than
 applied.
