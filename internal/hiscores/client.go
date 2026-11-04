@@ -19,13 +19,28 @@ const BaseURL = "https://secure.runescape.com/m=hiscore_oldschool"
 const StatsPath = "/index_lite.json?player="
 
 // Mode names one hiscores table. Values are what Anvil.Site writes into hiscores_fetches.mode.
+//
+// Two families share this one column:
+//   - account-type tables (main, ironman, hardcore, ultimate) — the same character on a different
+//     ladder. "hardcore" is Hardcore IRONMAN, and stays that way for the Site's existing rows.
+//   - game-mode world tables (hardcore_mains, seasonal, deadman, fresh_start, tournament) — a
+//     separate save on a separate world type, read by the Site to corroborate what the plugin
+//     pushed from that world. Named so none of them can be confused with an account type.
 type Mode string
 
 const (
 	ModeMain     Mode = "main"
 	ModeIronman  Mode = "ironman"
-	ModeHardcore Mode = "hardcore"
+	ModeHardcore Mode = "hardcore" // Hardcore Ironman, not Hardcore Worlds — see ModeHardcoreMains.
 	ModeUltimate Mode = "ultimate"
+
+	// ModeHardcoreMains is the Hardcore Worlds table (launched 2026-11-04).
+	ModeHardcoreMains Mode = "hardcore_mains"
+	// ModeSeasonal is Leagues.
+	ModeSeasonal   Mode = "seasonal"
+	ModeDeadman    Mode = "deadman"
+	ModeFreshStart Mode = "fresh_start"
+	ModeTournament Mode = "tournament"
 )
 
 // tableSuffix maps a mode onto its table's URL: m=hiscore_oldschool<suffix>/index_lite.json.
@@ -34,6 +49,19 @@ var tableSuffix = map[Mode]string{
 	ModeIronman:  "_ironman",
 	ModeHardcore: "_hardcore_ironman",
 	ModeUltimate: "_ultimate",
+
+	ModeHardcoreMains: "_hardcore_mains",
+	ModeSeasonal:      "_seasonal",
+	ModeDeadman:       "_deadman",
+	ModeFreshStart:    "_fresh_start",
+	ModeTournament:    "_tournament",
+}
+
+// Known reports whether Forge has a table for mode. Anything else is answered "unranked" without
+// a request, so a mode the Site starts writing before Forge learns it costs no budget.
+func Known(mode Mode) bool {
+	_, ok := tableSuffix[mode]
+	return ok
 }
 
 // ErrUnknownMode is returned for a mode Forge has no table for. Terminal for that request.
@@ -126,6 +154,8 @@ func (c *Client) Fetch(ctx context.Context, rsn string, mode Mode) Result {
 	}
 	suffix, ok := tableSuffix[mode]
 	if !ok {
+		// No request is made: an unknown mode must never fall through to the main table, which
+		// would hand the Site a main-game body labelled as some other ladder.
 		return Result{Outcome: OutcomeUnranked, Err: fmt.Errorf("%w: %q", ErrUnknownMode, mode)}
 	}
 

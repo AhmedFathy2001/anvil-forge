@@ -51,7 +51,13 @@ it through the exact code its in-app fetch uses. A read older than 30 minutes is
 applied.
 
 `mode` picks the table — `main`, `ironman`, `hardcore`, `ultimate` — so the account-type check is the
-same queue with a different mode.
+same queue with a different mode. (`hardcore` is Hardcore Ironman.)
+
+The game-mode world tables ride the same queue: `hardcore_mains` (Hardcore Worlds), `seasonal`
+(Leagues), `deadman`, `fresh_start`, `tournament`. The Site enqueues them only for players who pushed
+stats from that world on a live board that opted the mode in, and uses the body to corroborate those
+pushes. A mode Forge does not know is answered `unranked` without a request, never read from the main
+table.
 
 The earlier `forge_player_events` outbox (Forge scheduling and scoring-adjacent writes) is retired.
 
