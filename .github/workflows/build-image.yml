@@ -176,10 +176,11 @@ jobs:
               if echo "$body" | grep -q "$EXPECTED_SHA"; then
                 echo "anvil-forge-beta healthy on $EXPECTED_SHA"; exit 0
               fi
-              echo "waiting for health… ($i/20) got: ${body:-nothing}"; sleep 3
+              echo "waiting for health… ($i/20)"; sleep 3
             done
-            echo "::error::anvil-forge-beta did not report sha $EXPECTED_SHA within ~60s"
-            docker logs --tail 50 anvil-forge-beta || true
+            # Its logs stay on the box: CI output is readable by anyone who can see the run.
+            docker logs --tail 200 anvil-forge-beta > /opt/anvil/beta/failed-deploy.log 2>&1 || true
+            echo "::error::anvil-forge-beta did not report sha $EXPECTED_SHA within ~60s (logs: /opt/anvil/beta/failed-deploy.log on the box)"
             exit 1
 
   # Production: only a release tag (scripts/release.sh). Recreates anvil-forge through the box's own
@@ -227,8 +228,9 @@ jobs:
               if echo "$body" | grep -q "$EXPECTED_SHA"; then
                 echo "anvil-forge healthy on $EXPECTED_SHA"; exit 0
               fi
-              echo "waiting for health… ($i/20) got: ${body:-nothing}"; sleep 3
+              echo "waiting for health… ($i/20)"; sleep 3
             done
-            echo "::error::anvil-forge did not report sha $EXPECTED_SHA within ~60s"
-            docker logs --tail 50 anvil-forge || true
+            # Its logs stay on the box: CI output is readable by anyone who can see the run.
+            docker logs --tail 200 anvil-forge > /opt/anvil/forge/failed-deploy.log 2>&1 || true
+            echo "::error::anvil-forge did not report sha $EXPECTED_SHA within ~60s (logs: /opt/anvil/forge/failed-deploy.log on the box)"
             exit 1
