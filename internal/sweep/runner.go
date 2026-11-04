@@ -85,10 +85,15 @@ func (r *Runner) Tick(ctx context.Context) (int, error) {
 		go func() {
 			defer wg.Done()
 			for req := range queue {
-				if err := r.Limiter.Wait(ctx); err != nil {
-					return // cancelled; unclaimed rows return after their lease
+				mode := hiscores.Mode(req.Mode)
+				// A mode with no table is answered without a request, so it must not spend a token
+				// of the global budget either.
+				if hiscores.Known(mode) {
+					if err := r.Limiter.Wait(ctx); err != nil {
+						return // cancelled; unclaimed rows return after their lease
+					}
 				}
-				res := r.Hiscores.Fetch(ctx, req.Rsn, hiscores.Mode(req.Mode))
+				res := r.Hiscores.Fetch(ctx, req.Rsn, mode)
 				if ctx.Err() != nil {
 					return // a cancelled fetch is not a result; let the lease hand it back
 				}

@@ -97,3 +97,25 @@ func TestTickFetchesEveryClaimAndWritesTheResultBack(t *testing.T) {
 		t.Fatalf("idle tick claimed %d, runs %d", n, q.runs)
 	}
 }
+
+// A mode Forge has no table for is answered "unranked" without waiting on the global budget: the
+// limiter here has no tokens at all, so a Wait would block until the context gives up.
+func TestUnknownModeSpendsNoBudget(t *testing.T) {
+	q := &fakeQueue{
+		pending:   []store.Request{{ID: 1, Rsn: "Someone", Mode: "grid_master"}},
+		completed: map[int64]string{},
+		bodies:    map[int64]string{},
+	}
+	r := &Runner{
+		Queue: q, Hiscores: hiscores.NewClient("test"), Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Limiter: rate.NewLimiter(0, 0), Workers: 1, ClaimBatch: 10, ClaimLease: time.Minute,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := r.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if q.completed[1] != "unranked" {
+		t.Fatalf("outcome = %q", q.completed[1])
+	}
+}
