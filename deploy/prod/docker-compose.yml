@@ -1,0 +1,14 @@
+# /opt/anvil/forge/docker-compose.yml — production Forge, a singleton for the whole box.
+# Settings live in forge.env beside this file (copied from the hand-started container's env once,
+# then kept here). The image is pinned by deploy.sh through .env.
+name: anvil-forge
+services:
+  anvil-forge:
+    image: ${FORGE_IMAGE:?set by deploy.sh}
+    container_name: anvil-forge
+    restart: unless-stopped
+    env_file: forge.env
+    networks: [anvil_default]
+networks:
+  anvil_default:
+    external: true
