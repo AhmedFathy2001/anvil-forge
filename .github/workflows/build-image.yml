@@ -7,15 +7,21 @@ name: Build & deploy
 # because its hiscores rate budget is global and cannot be divided across replicas without
 # coordination. So this mirrors Anvil.Admin's shape instead: pull, recreate, health-gate.
 #
-#   main → :stable (+ :latest) → deployed
-#   beta → :beta               → deployed to the same box (see FORGE_CHANNEL below)
-#   v*   → :1.2.3 + :1.2       → pinned images for self-hosters, NO deploy
+#   beta push      → :beta                              → deployed to beta (anvil-forge-beta)
+#   vX.Y.Z tag     → :X.Y.Z + :X.Y + :stable + :latest  → deployed to production (anvil-forge)
 #
-# Every push also gets an immutable :sha-<full> tag, which is what the box actually pins.
+# Production is RELEASE-BASED, like the Site: scripts/release.sh tags a commit beta has already run,
+# and only that tag deploys production. A push to main deploys nothing (main just follows releases).
+#
+# Every build also gets an immutable :sha-<full> tag, which is what the box actually pins.
+#
+# Deploys need repo secrets SSH_HOST / SSH_USER / SSH_KEY (optional SSH_PORT). Without them a deploy
+# FAILS with an error instead of skipping: a green run that deployed nothing is how beta sat on a
+# three-week-old build without anyone noticing.
 
 on:
   push:
-    branches: [main, beta]
+    branches: [beta]
     tags: ['v*']
   pull_request:
     branches: [main, beta]
@@ -81,8 +87,8 @@ jobs:
         with:
           images: ghcr.io/ahmedfathy2001/anvil-forge
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=raw,value=stable,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=beta,enable=${{ github.ref == 'refs/heads/beta' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -116,6 +122,13 @@ jobs:
     env:
       SSH_HOST: ${{ secrets.SSH_HOST }}
     steps:
+      - name: Deploy secrets present
+        run: |
+          if [ -z "$SSH_HOST" ]; then
+            echo "::error::SSH_HOST / SSH_USER / SSH_KEY repo secrets are not set, so nothing was deployed."
+            exit 1
+          fi
+
       - name: Deploy over SSH
         if: env.SSH_HOST != ''
         uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
@@ -167,4 +180,55 @@ jobs:
             done
             echo "::error::anvil-forge-beta did not report sha $EXPECTED_SHA within ~60s"
             docker logs --tail 50 anvil-forge-beta || true
+            exit 1
+
+  # Production: only a release tag (scripts/release.sh). Recreates anvil-forge through the box's own
+  # /opt/anvil/forge/deploy.sh, which holds production's run settings (env file, network, volumes)
+  # so none of them live in this repo, then health-gates on the tagged commit.
+  deploy-prod:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # A release waits for the previous one: two production rollouts must never interleave.
+    concurrency:
+      group: forge-prod-deploy
+      cancel-in-progress: false
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+    steps:
+      - name: Deploy secrets present
+        run: |
+          if [ -z "$SSH_HOST" ]; then
+            echo "::error::SSH_HOST / SSH_USER / SSH_KEY repo secrets are not set, so production was not deployed."
+            exit 1
+          fi
+
+      - name: Deploy to production
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          IMAGE: ghcr.io/ahmedfathy2001/anvil-forge:sha-${{ github.sha }}
+          EXPECTED_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          envs: IMAGE,EXPECTED_SHA
+          script: |
+            set -euo pipefail
+            if [ ! -x /opt/anvil/forge/deploy.sh ]; then
+              echo "::error::/opt/anvil/forge/deploy.sh is missing on the box; production was not deployed."
+              exit 1
+            fi
+            /opt/anvil/forge/deploy.sh "$IMAGE"
+            for i in $(seq 1 20); do
+              body="$(docker run --rm --network container:anvil-forge curlimages/curl:8.11.1 \
+                       -fsS --max-time 5 http://127.0.0.1:8080/health 2>/dev/null || true)"
+              if echo "$body" | grep -q "$EXPECTED_SHA"; then
+                echo "anvil-forge healthy on $EXPECTED_SHA"; exit 0
+              fi
+              echo "waiting for health… ($i/20) got: ${body:-nothing}"; sleep 3
+            done
+            echo "::error::anvil-forge did not report sha $EXPECTED_SHA within ~60s"
+            docker logs --tail 50 anvil-forge || true
             exit 1
