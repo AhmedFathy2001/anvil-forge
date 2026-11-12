@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,10 @@ import (
 // MaxIngestBody caps a single push. Generous enough for a full stats blob, small enough that a
 // malformed or hostile client cannot make us buffer megabytes per request.
 const MaxIngestBody = 512 << 10 // 512 KiB
+
+// MaxIngestBatch caps the events in one push. Each is its own INSERT, and a 512 KiB body of tiny
+// events was thousands of writes from a single request.
+const MaxIngestBatch = 100
 
 // SeenInterval is how often a token's last_seen_at is refreshed. A 30-second poll from every
 // install must not become a write per request.
@@ -194,6 +199,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	batch := req.Events
 	if len(batch) == 0 {
 		batch = []ingestRequest{req}
+	}
+	if len(batch) > MaxIngestBatch {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("At most %d events per push", MaxIngestBatch))
+		return
 	}
 
 	accepted, duplicates := 0, 0

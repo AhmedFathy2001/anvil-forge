@@ -88,8 +88,10 @@ func Load() (*Config, error) {
 		DryRun:        envBool("FORGE_DRY_RUN", false),
 		HTTPAddr:      envStr("FORGE_HTTP_ADDR", ":8080"),
 
-		EnableSweep:   envBool("FORGE_ENABLE_SWEEP", true),
-		EnableEdge:    envBool("FORGE_ENABLE_EDGE", true),
+		EnableSweep: envBool("FORGE_ENABLE_SWEEP", true),
+		// Off unless asked for: nothing issues edge credentials and no plugin calls it yet, so an edge
+		// on by default was an unauthenticated public surface (the board read) for nothing.
+		EnableEdge:    envBool("FORGE_ENABLE_EDGE", false),
 		EnableDiscord: envBool("FORGE_ENABLE_DISCORD", true),
 
 		DiscordWorkers:       envInt("FORGE_DISCORD_WORKERS", 16),

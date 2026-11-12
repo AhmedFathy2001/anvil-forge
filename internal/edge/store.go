@@ -143,9 +143,13 @@ func (s *Store) TouchSeen(ctx context.Context, tokenHash []byte, interval time.D
 // A repeated dedupe key is a no-op: the plugin retries on a flaky connection, and a retried kill
 // must not credit twice. Returns false when the event was a duplicate.
 func (s *Store) Ingest(ctx context.Context, c *Caller, kind string, payload json.RawMessage, dedupeKey string) (bool, error) {
+	// Scoped to the caller. The unique index is global and the key is the client's own string, so an
+	// unscoped key let one token holder pre-insert another player's key and have that player's real
+	// event dropped as a "duplicate". Prefixing the credential keeps every caller in its own space.
 	var key *string
 	if dedupeKey != "" {
-		key = &dedupeKey
+		scoped := fmt.Sprintf("%x:%s", c.TokenHash, dedupeKey)
+		key = &scoped
 	}
 
 	tag, err := s.pool.Exec(ctx, `
