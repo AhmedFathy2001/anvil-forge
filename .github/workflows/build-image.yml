@@ -5,7 +5,7 @@ name: Build & deploy
 # Deliberately NOT the Site's rollout pattern. The Site fans a new image out across many clan
 # containers through the control plane; Forge is a SINGLETON — one process for the whole box,
 # because its hiscores rate budget is global and cannot be divided across replicas without
-# coordination. So this mirrors Anvil.Admin's shape instead: pull, recreate, health-gate.
+# coordination. So the deploy is simply: pull, recreate, health-gate.
 #
 #   main → :stable (+ :latest) → deployed
 #   beta → :beta               → deployed to the same box (see FORGE_CHANNEL below)
